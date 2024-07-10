@@ -1658,6 +1658,10 @@ impl Validator {
             .join()
             .expect("poh_timing_report_service");
     }
+
+    pub fn poh_recorder(&self) -> Arc<RwLock<PohRecorder>> {
+        self.poh_recorder.clone()
+    }
 }
 
 fn active_vote_account_exists_in_bank(bank: &Bank, vote_account: &Pubkey) -> bool {

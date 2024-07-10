@@ -7559,6 +7559,7 @@ dependencies = [
  "solana-ledger",
  "solana-logger",
  "solana-net-utils",
+ "solana-poh",
  "solana-program-test",
  "solana-rpc",
  "solana-rpc-client",
@@ -7666,6 +7667,19 @@ dependencies = [
  "solana-rpc-client-api",
  "solana-sdk",
  "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "solana-tpu-client-test"
+version = "2.1.0"
+dependencies = [
+ "clap 3.2.23",
+ "log",
+ "solana-client",
+ "solana-logger",
+ "solana-sdk",
+ "solana-test-validator",
  "tokio",
 ]
 
