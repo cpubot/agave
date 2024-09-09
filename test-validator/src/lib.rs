@@ -29,6 +29,7 @@ use {
         create_new_tmp_ledger,
     },
     solana_net_utils::PortRange,
+    solana_poh::poh_recorder::PohRecorder,
     solana_rpc::{rpc::JsonRpcConfig, rpc_pubsub_service::PubSubConfig},
     solana_rpc_client::{nonblocking, rpc_client::RpcClient},
     solana_rpc_client_api::request::MAX_MULTIPLE_ACCOUNTS,
@@ -692,6 +693,14 @@ impl TestValidator {
             .faucet_addr(faucet_addr)
             .start_with_mint_address(mint_address, socket_addr_space)
             .expect("validator start failed")
+    }
+
+    pub fn current_slot(&self) -> u64 {
+        self.poh_recorder().read().unwrap().current_slot()
+    }
+
+    pub fn poh_recorder(&self) -> Arc<RwLock<PohRecorder>> {
+        self.validator.as_ref().unwrap().poh_recorder()
     }
 
     /// Create a test validator using udp for TPU.

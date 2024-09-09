@@ -1,0 +1,19 @@
+[package]
+name = "solana-tpu-client-test"
+description = "Solana TPU Client Test"
+publish = false
+version = { workspace = true }
+authors = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
+
+[dependencies]
+clap = { version = "3.1.5", features = ["cargo", "derive"] }
+log = { workspace = true }
+solana-client = { workspace = true }
+solana-logger = { workspace = true }
+solana-sdk = { workspace = true }
+solana-test-validator = { workspace = true }
+tokio = { workspace = true, features = ["full"] }

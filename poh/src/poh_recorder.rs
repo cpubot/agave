@@ -366,6 +366,10 @@ impl PohRecorder {
             )
     }
 
+    pub fn current_slot(&self) -> Slot {
+        self.slot_for_tick_height(self.tick_height)
+    }
+
     // Return the slot for a given tick height
     fn slot_for_tick_height(&self, tick_height: u64) -> Slot {
         // We need to subtract by one here because, assuming ticks per slot is 64,
