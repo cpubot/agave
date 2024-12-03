@@ -7597,7 +7597,6 @@ dependencies = [
  "scopeguard",
  "serde",
  "serde_bytes",
- "serde_with",
  "sha2 0.10.8",
  "solana-account-decoder",
  "solana-accounts-db",
