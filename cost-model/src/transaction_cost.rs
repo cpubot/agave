@@ -1,3 +1,5 @@
+#[cfg(feature = "dev-context-only-utils")]
+use solana_runtime_transaction::compute_budget_instruction_details::ComputeBudgetInstructionDetails;
 use {
     crate::block_cost_limits,
     solana_runtime_transaction::transaction_with_meta::TransactionWithMeta,
@@ -184,7 +186,8 @@ impl solana_svm_transaction::svm_message::SVMMessage for WritableKeysTransaction
 
     fn program_instructions_iter(
         &self,
-    ) -> impl Iterator<Item = (&Pubkey, solana_svm_transaction::instruction::SVMInstruction)> {
+    ) -> impl Iterator<Item = (&Pubkey, solana_svm_transaction::instruction::SVMInstruction)> + Clone
+    {
         core::iter::empty()
     }
 
@@ -244,17 +247,12 @@ impl solana_runtime_transaction::transaction_meta::StaticMeta for WritableKeysTr
 
     fn signature_details(&self) -> &solana_sdk::message::TransactionSignatureDetails {
         const DUMMY: solana_sdk::message::TransactionSignatureDetails =
-            solana_sdk::message::TransactionSignatureDetails::new(0, 0, 0);
+            solana_sdk::message::TransactionSignatureDetails::new(0, 0, 0, 0);
         &DUMMY
     }
 
-    fn compute_budget_limits(
-        &self,
-        _feature_set: &solana_feature_set::FeatureSet,
-    ) -> solana_sdk::transaction::Result<
-        solana_compute_budget::compute_budget_limits::ComputeBudgetLimits,
-    > {
-        unimplemented!("WritableKeysTransaction::compute_budget_limits")
+    fn compute_budget_instruction_details(&self) -> &ComputeBudgetInstructionDetails {
+        unimplemented!("WritableKeysTransaction::compute_budget_instruction_details")
     }
 }
 
@@ -326,8 +324,8 @@ mod tests {
 
         // expected vote tx cost: 2 write locks, 1 sig, 1 vote ix, 8cu of loaded accounts size,
         let expected_vote_cost = SIMPLE_VOTE_USAGE_COST;
-        // expected non-vote tx cost would include default loaded accounts size cost (16384) additionally
-        let expected_none_vote_cost = 20543;
+        // expected non-vote tx cost would include default loaded accounts size cost (16384) additionally, and 3_000 for instruction
+        let expected_none_vote_cost = 21443;
 
         let vote_cost = CostModel::calculate_cost(&vote_transaction, &FeatureSet::all_enabled());
         let none_vote_cost =

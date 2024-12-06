@@ -10,7 +10,7 @@ use {
         use_snapshot_archives_at_startup::UseSnapshotArchivesAtStartup,
     },
     chrono_humanize::{Accuracy, HumanTime, Tense},
-    crossbeam_channel::Sender,
+    crossbeam_channel::{Receiver, Sender},
     itertools::Itertools,
     log::*,
     rayon::{prelude::*, ThreadPool},
@@ -28,7 +28,7 @@ use {
     solana_rayon_threadlimit::{get_max_thread_count, get_thread_count},
     solana_runtime::{
         accounts_background_service::{AbsRequestSender, SnapshotRequestKind},
-        bank::{Bank, TransactionBalancesSet},
+        bank::{Bank, KeyedRewardsAndNumPartitions, TransactionBalancesSet},
         bank_forks::{BankForks, SetRootError},
         bank_utils,
         commitment::VOTE_THRESHOLD_SIZE,
@@ -914,6 +914,7 @@ pub fn test_process_blockstore(
         None,
         None,
         None,
+        None,
         &abs_request_sender,
     )
     .unwrap();
@@ -979,6 +980,7 @@ pub fn process_blockstore_from_root(
     opts: &ProcessOptions,
     transaction_status_sender: Option<&TransactionStatusSender>,
     cache_block_meta_sender: Option<&CacheBlockMetaSender>,
+    rewards_recorder_sender: Option<&RewardsRecorderSender>,
     entry_notification_sender: Option<&EntryNotifierSender>,
     accounts_background_request_sender: &AbsRequestSender,
 ) -> result::Result<(), BlockstoreProcessorError> {
@@ -1045,6 +1047,7 @@ pub fn process_blockstore_from_root(
             opts,
             transaction_status_sender,
             cache_block_meta_sender,
+            rewards_recorder_sender,
             entry_notification_sender,
             &mut timing,
             accounts_background_request_sender,
@@ -1859,6 +1862,7 @@ fn load_frozen_forks(
     opts: &ProcessOptions,
     transaction_status_sender: Option<&TransactionStatusSender>,
     cache_block_meta_sender: Option<&CacheBlockMetaSender>,
+    rewards_recorder_sender: Option<&RewardsRecorderSender>,
     entry_notification_sender: Option<&EntryNotifierSender>,
     timing: &mut ExecuteTimings,
     accounts_background_request_sender: &AbsRequestSender,
@@ -1961,6 +1965,10 @@ fn load_frozen_forks(
             all_banks.insert(bank.slot(), bank.clone_with_scheduler());
             m.stop();
             process_single_slot_us += m.as_us();
+
+            rewards_recorder_sender
+                .as_ref()
+                .inspect(|sender| sender.send_rewards(&bank));
 
             let mut m = Measure::start("voting");
             // If we've reached the last known root in blockstore, start looking
@@ -2275,6 +2283,38 @@ pub fn cache_block_meta(bank: &Arc<Bank>, cache_block_meta_sender: Option<&Cache
     }
 }
 
+pub type RewardsBatch = (Slot, KeyedRewardsAndNumPartitions);
+pub enum RewardsMessage {
+    Batch(RewardsBatch),
+    Complete(Slot),
+}
+
+#[derive(Clone, Debug)]
+pub struct RewardsRecorderSender {
+    pub sender: Sender<RewardsMessage>,
+}
+pub type RewardsRecorderReceiver = Receiver<RewardsMessage>;
+
+impl From<Sender<RewardsMessage>> for RewardsRecorderSender {
+    fn from(sender: Sender<RewardsMessage>) -> Self {
+        Self { sender }
+    }
+}
+
+impl RewardsRecorderSender {
+    pub fn send_rewards(&self, bank: &Bank) {
+        let rewards = bank.get_rewards_and_num_partitions();
+        if rewards.should_record() {
+            self.sender
+                .send(RewardsMessage::Batch((bank.slot(), rewards)))
+                .unwrap_or_else(|err| warn!("rewards_recorder_sender failed: {:?}", err));
+        }
+        self.sender
+            .send(RewardsMessage::Complete(bank.slot()))
+            .unwrap_or_else(|err| warn!("rewards_recorder_sender failed: {:?}", err));
+    }
+}
+
 // used for tests only
 pub fn fill_blockstore_slot_with_ticks(
     blockstore: &Blockstore,
@@ -2313,7 +2353,8 @@ pub mod tests {
         crate::{
             blockstore_options::{AccessType, BlockstoreOptions},
             genesis_utils::{
-                create_genesis_config, create_genesis_config_with_leader, GenesisConfigInfo,
+                create_genesis_config, create_genesis_config_with_leader,
+                create_genesis_config_with_mint_keypair, GenesisConfigInfo,
             },
         },
         assert_matches::assert_matches,
@@ -2341,6 +2382,7 @@ pub mod tests {
             pubkey::Pubkey,
             rent_debits::RentDebits,
             signature::{Keypair, Signer},
+            signer::SeedDerivable,
             system_instruction::SystemError,
             system_transaction,
             transaction::{Transaction, TransactionError},
@@ -2357,6 +2399,7 @@ pub mod tests {
             vote_transaction,
         },
         std::{collections::BTreeSet, sync::RwLock},
+        test_case::test_case,
         trees::tr,
     };
 
@@ -3419,14 +3462,19 @@ pub mod tests {
         }
     }
 
-    #[test]
-    fn test_transaction_result_does_not_affect_bankhash() {
+    #[test_case(true; "rent_collected")]
+    #[test_case(false; "rent_not_collected")]
+    fn test_transaction_result_does_not_affect_bankhash(fee_payer_in_rent_partition: bool) {
         solana_logger::setup();
         let GenesisConfigInfo {
             genesis_config,
             mint_keypair,
             ..
-        } = create_genesis_config(1000);
+        } = if fee_payer_in_rent_partition {
+            create_genesis_config(1000)
+        } else {
+            create_genesis_config_with_mint_keypair(Keypair::from_seed(&[1u8; 32]).unwrap(), 1000)
+        };
 
         fn get_instruction_errors() -> Vec<InstructionError> {
             vec![
@@ -3492,7 +3540,7 @@ pub mod tests {
             Ok(())
         });
 
-        let mock_program_id = solana_sdk::pubkey::new_rand();
+        let mock_program_id = Pubkey::new_unique();
 
         let (bank, _bank_forks) = Bank::new_with_mockup_builtin_for_tests(
             &genesis_config,
@@ -3556,7 +3604,8 @@ pub mod tests {
 
             let entry = next_entry(&bank.last_blockhash(), 1, vec![tx]);
             let bank = Arc::new(bank);
-            let _result = process_entries_for_tests_without_scheduler(&bank, vec![entry]);
+            let result = process_entries_for_tests_without_scheduler(&bank, vec![entry]);
+            assert!(result.is_ok()); // No failing transaction error - only instruction errors
             bank.freeze();
             let bank_details = SlotDetails::new_from_bank(&bank, true).unwrap();
 
@@ -3573,8 +3622,8 @@ pub mod tests {
                     .unwrap()
                     .last_blockhash
             );
-            // ... but should affect bank hash
-            assert_ne!(ok_bank_details, bank_details);
+            // AND should not affect bankhash IF the rent is collected during freeze.
+            assert_eq!(ok_bank_details == bank_details, fee_payer_in_rent_partition);
             // Different types of transaction failure should not affect bank hash
             if let Some(prev_bank_details) = &err_bank_details {
                 assert_eq!(
@@ -4158,6 +4207,7 @@ pub mod tests {
             &bank_forks,
             &leader_schedule_cache,
             &opts,
+            None,
             None,
             None,
             None,
