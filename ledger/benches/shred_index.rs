@@ -140,6 +140,7 @@ impl Serialize for U64ShredIndex {
     where
         S: serde::Serializer,
     {
+        use serde::ser::SerializeTuple;
         // SAFETY: This is safe because:
         // 1. Memory initialization & layout:
         //    - index is a fixed-size array [u64; NUM_U64S] fully initialized
@@ -154,12 +155,15 @@ impl Serialize for U64ShredIndex {
         //    - slice lifetime is tied to &self and is read-only
         //
         // Note: Deserialization will validate the byte length and safely reconstruct the u64 array
-        serializer.serialize_bytes(unsafe {
+        let mut tuple = serializer.serialize_tuple(2)?;
+        tuple.serialize_element(&serde_bytes::Bytes::new(unsafe {
             std::slice::from_raw_parts(
                 &self.index as *const _ as *const u8,
                 std::mem::size_of::<[u64; NUM_U64S]>(),
             )
-        })
+        }))?;
+        tuple.serialize_element(&self.num_shreds)?;
+        tuple.end()
     }
 }
 
@@ -168,24 +172,21 @@ impl<'de> Deserialize<'de> for U64ShredIndex {
     where
         D: serde::Deserializer<'de>,
     {
-        let bytes = <&[u8]>::deserialize(deserializer)?;
-        if bytes.len() != std::mem::size_of::<[u64; NUM_U64S]>() {
-            return Err(serde::de::Error::custom("invalid length"));
+        use serde::de::Error;
+
+        let (bytes, num_shreds) = <(&[u8], usize)>::deserialize(deserializer)?;
+
+        if bytes.len() > std::mem::size_of::<[u64; NUM_U64S]>() {
+            return Err(D::Error::custom("input too large"));
         }
+
         let mut index = [0u64; NUM_U64S];
-        for i in 0..NUM_U64S {
-            let start = i * 8;
-            let end = start + 8;
-            index[i] = u64::from_ne_bytes(
-                bytes[start..end]
-                    .try_into()
-                    .map_err(|_| serde::de::Error::custom("invalid u64 bytes"))?,
-            );
-        }
-        Ok(Self {
-            index,
-            num_shreds: index.iter().map(|x| x.count_ones() as usize).sum(),
-        })
+        bytes.chunks_exact(8).enumerate().for_each(|(i, chunk)| {
+            // This is safe because chunks_exact(8) guarantees 8-byte chunks
+            index[i] = u64::from_ne_bytes(chunk.try_into().unwrap());
+        });
+
+        Ok(Self { index, num_shreds })
     }
 }
 
@@ -588,122 +589,122 @@ macro_rules! bench_insert_pattern {
 }
 
 // Window size benchmarks (64, 1024, 4096 bits) for each implementation
-bench_range_window!(bench_window_64_byte, ByteShredIndex, 64);
-bench_range_window!(bench_window_1024_byte, ByteShredIndex, 1024);
-bench_range_window!(bench_window_4096_byte, ByteShredIndex, 4096);
+// bench_range_window!(bench_window_64_byte, ByteShredIndex, 64);
+// bench_range_window!(bench_window_1024_byte, ByteShredIndex, 1024);
+// bench_range_window!(bench_window_4096_byte, ByteShredIndex, 4096);
 
-bench_range_window!(bench_window_64_bit_array, BitArrayShredIndex, 64);
-bench_range_window!(bench_window_1024_bit_array, BitArrayShredIndex, 1024);
-bench_range_window!(bench_window_4096_bit_array, BitArrayShredIndex, 4096);
+// bench_range_window!(bench_window_64_bit_array, BitArrayShredIndex, 64);
+// bench_range_window!(bench_window_1024_bit_array, BitArrayShredIndex, 1024);
+// bench_range_window!(bench_window_4096_bit_array, BitArrayShredIndex, 4096);
 
-bench_range_window!(bench_window_64_legacy, LegacyShredIndex, 64);
-bench_range_window!(bench_window_1024_legacy, LegacyShredIndex, 1024);
-bench_range_window!(bench_window_4096_legacy, LegacyShredIndex, 4096);
+// bench_range_window!(bench_window_64_legacy, LegacyShredIndex, 64);
+// bench_range_window!(bench_window_1024_legacy, LegacyShredIndex, 1024);
+// bench_range_window!(bench_window_4096_legacy, LegacyShredIndex, 4096);
 
-bench_range_window!(bench_window_64_bv, BvShredIndex, 64);
-bench_range_window!(bench_window_1024_bv, BvShredIndex, 1024);
-bench_range_window!(bench_window_4096_bv, BvShredIndex, 4096);
+// bench_range_window!(bench_window_64_bv, BvShredIndex, 64);
+// bench_range_window!(bench_window_1024_bv, BvShredIndex, 1024);
+// bench_range_window!(bench_window_4096_bv, BvShredIndex, 4096);
 
-bench_range_window!(bench_window_64_u64, U64ShredIndex, 64);
-bench_range_window!(bench_window_1024_u64, U64ShredIndex, 1024);
-bench_range_window!(bench_window_4096_u64, U64ShredIndex, 4096);
+// bench_range_window!(bench_window_64_u64, U64ShredIndex, 64);
+// bench_range_window!(bench_window_1024_u64, U64ShredIndex, 1024);
+// bench_range_window!(bench_window_4096_u64, U64ShredIndex, 4096);
 
-// Density benchmarks (10%, 50%, 90%) for each implementation
-bench_range_density!(bench_density_10_byte, ByteShredIndex, 0.1, 1000);
-bench_range_density!(bench_density_50_byte, ByteShredIndex, 0.5, 1000);
-bench_range_density!(bench_density_90_byte, ByteShredIndex, 0.9, 1000);
-bench_range_density!(bench_density_10_byte_10k, ByteShredIndex, 0.1, 10000);
-bench_range_density!(bench_density_50_byte_10k, ByteShredIndex, 0.5, 10000);
-bench_range_density!(bench_density_90_byte_10k, ByteShredIndex, 0.9, 10000);
+// // Density benchmarks (10%, 50%, 90%) for each implementation
+// bench_range_density!(bench_density_10_byte, ByteShredIndex, 0.1, 1000);
+// bench_range_density!(bench_density_50_byte, ByteShredIndex, 0.5, 1000);
+// bench_range_density!(bench_density_90_byte, ByteShredIndex, 0.9, 1000);
+// bench_range_density!(bench_density_10_byte_10k, ByteShredIndex, 0.1, 10000);
+// bench_range_density!(bench_density_50_byte_10k, ByteShredIndex, 0.5, 10000);
+// bench_range_density!(bench_density_90_byte_10k, ByteShredIndex, 0.9, 10000);
 
-bench_range_density!(bench_density_10_bit_array, BitArrayShredIndex, 0.1, 1000);
-bench_range_density!(bench_density_50_bit_array, BitArrayShredIndex, 0.5, 1000);
-bench_range_density!(bench_density_90_bit_array, BitArrayShredIndex, 0.9, 1000);
-bench_range_density!(
-    bench_density_10_bit_array_10k,
-    BitArrayShredIndex,
-    0.1,
-    10000
-);
-bench_range_density!(
-    bench_density_50_bit_array_10k,
-    BitArrayShredIndex,
-    0.5,
-    10000
-);
-bench_range_density!(
-    bench_density_90_bit_array_10k,
-    BitArrayShredIndex,
-    0.9,
-    10000
-);
+// bench_range_density!(bench_density_10_bit_array, BitArrayShredIndex, 0.1, 1000);
+// bench_range_density!(bench_density_50_bit_array, BitArrayShredIndex, 0.5, 1000);
+// bench_range_density!(bench_density_90_bit_array, BitArrayShredIndex, 0.9, 1000);
+// bench_range_density!(
+//     bench_density_10_bit_array_10k,
+//     BitArrayShredIndex,
+//     0.1,
+//     10000
+// );
+// bench_range_density!(
+//     bench_density_50_bit_array_10k,
+//     BitArrayShredIndex,
+//     0.5,
+//     10000
+// );
+// bench_range_density!(
+//     bench_density_90_bit_array_10k,
+//     BitArrayShredIndex,
+//     0.9,
+//     10000
+// );
 
-bench_range_density!(bench_density_10_legacy, LegacyShredIndex, 0.1, 1000);
-bench_range_density!(bench_density_50_legacy, LegacyShredIndex, 0.5, 1000);
-bench_range_density!(bench_density_90_legacy, LegacyShredIndex, 0.9, 1000);
-bench_range_density!(bench_density_10_legacy_10k, LegacyShredIndex, 0.1, 10000);
-bench_range_density!(bench_density_50_legacy_10k, LegacyShredIndex, 0.5, 10000);
-bench_range_density!(bench_density_90_legacy_10k, LegacyShredIndex, 0.9, 10000);
+// bench_range_density!(bench_density_10_legacy, LegacyShredIndex, 0.1, 1000);
+// bench_range_density!(bench_density_50_legacy, LegacyShredIndex, 0.5, 1000);
+// bench_range_density!(bench_density_90_legacy, LegacyShredIndex, 0.9, 1000);
+// bench_range_density!(bench_density_10_legacy_10k, LegacyShredIndex, 0.1, 10000);
+// bench_range_density!(bench_density_50_legacy_10k, LegacyShredIndex, 0.5, 10000);
+// bench_range_density!(bench_density_90_legacy_10k, LegacyShredIndex, 0.9, 10000);
 
-bench_range_density!(bench_density_10_bv, BvShredIndex, 0.1, 1000);
-bench_range_density!(bench_density_50_bv, BvShredIndex, 0.5, 1000);
-bench_range_density!(bench_density_90_bv, BvShredIndex, 0.9, 1000);
-bench_range_density!(bench_density_10_bv_10k, BvShredIndex, 0.1, 10000);
-bench_range_density!(bench_density_50_bv_10k, BvShredIndex, 0.5, 10000);
-bench_range_density!(bench_density_90_bv_10k, BvShredIndex, 0.9, 10000);
+// bench_range_density!(bench_density_10_bv, BvShredIndex, 0.1, 1000);
+// bench_range_density!(bench_density_50_bv, BvShredIndex, 0.5, 1000);
+// bench_range_density!(bench_density_90_bv, BvShredIndex, 0.9, 1000);
+// bench_range_density!(bench_density_10_bv_10k, BvShredIndex, 0.1, 10000);
+// bench_range_density!(bench_density_50_bv_10k, BvShredIndex, 0.5, 10000);
+// bench_range_density!(bench_density_90_bv_10k, BvShredIndex, 0.9, 10000);
 
-bench_range_density!(bench_density_10_u64, U64ShredIndex, 0.1, 1000);
-bench_range_density!(bench_density_50_u64, U64ShredIndex, 0.5, 1000);
-bench_range_density!(bench_density_90_u64, U64ShredIndex, 0.9, 1000);
-bench_range_density!(bench_density_10_u64_10k, U64ShredIndex, 0.1, 10000);
-bench_range_density!(bench_density_50_u64_10k, U64ShredIndex, 0.5, 10000);
-bench_range_density!(bench_density_90_u64_10k, U64ShredIndex, 0.9, 10000);
+// bench_range_density!(bench_density_10_u64, U64ShredIndex, 0.1, 1000);
+// bench_range_density!(bench_density_50_u64, U64ShredIndex, 0.5, 1000);
+// bench_range_density!(bench_density_90_u64, U64ShredIndex, 0.9, 1000);
+// bench_range_density!(bench_density_10_u64_10k, U64ShredIndex, 0.1, 10000);
+// bench_range_density!(bench_density_50_u64_10k, U64ShredIndex, 0.5, 10000);
+// bench_range_density!(bench_density_90_u64_10k, U64ShredIndex, 0.9, 10000);
 
-// Distribution pattern benchmarks (sequential, random, clustered) for each implementation
-bench_range_distribution!(bench_dist_seq_byte, ByteShredIndex, "sequential");
-bench_range_distribution!(bench_dist_rand_byte, ByteShredIndex, "random");
-bench_range_distribution!(bench_dist_clust_byte, ByteShredIndex, "clustered");
+// // Distribution pattern benchmarks (sequential, random, clustered) for each implementation
+// bench_range_distribution!(bench_dist_seq_byte, ByteShredIndex, "sequential");
+// bench_range_distribution!(bench_dist_rand_byte, ByteShredIndex, "random");
+// bench_range_distribution!(bench_dist_clust_byte, ByteShredIndex, "clustered");
 
-bench_range_distribution!(bench_dist_seq_bit_array, BitArrayShredIndex, "sequential");
-bench_range_distribution!(bench_dist_rand_bit_array, BitArrayShredIndex, "random");
-bench_range_distribution!(bench_dist_clust_bit_array, BitArrayShredIndex, "clustered");
+// bench_range_distribution!(bench_dist_seq_bit_array, BitArrayShredIndex, "sequential");
+// bench_range_distribution!(bench_dist_rand_bit_array, BitArrayShredIndex, "random");
+// bench_range_distribution!(bench_dist_clust_bit_array, BitArrayShredIndex, "clustered");
 
-bench_range_distribution!(bench_dist_seq_legacy, LegacyShredIndex, "sequential");
-bench_range_distribution!(bench_dist_rand_legacy, LegacyShredIndex, "random");
-bench_range_distribution!(bench_dist_clust_legacy, LegacyShredIndex, "clustered");
+// bench_range_distribution!(bench_dist_seq_legacy, LegacyShredIndex, "sequential");
+// bench_range_distribution!(bench_dist_rand_legacy, LegacyShredIndex, "random");
+// bench_range_distribution!(bench_dist_clust_legacy, LegacyShredIndex, "clustered");
 
-bench_range_distribution!(bench_dist_seq_bv, BvShredIndex, "sequential");
-bench_range_distribution!(bench_dist_rand_bv, BvShredIndex, "random");
-bench_range_distribution!(bench_dist_clust_bv, BvShredIndex, "clustered");
+// bench_range_distribution!(bench_dist_seq_bv, BvShredIndex, "sequential");
+// bench_range_distribution!(bench_dist_rand_bv, BvShredIndex, "random");
+// bench_range_distribution!(bench_dist_clust_bv, BvShredIndex, "clustered");
 
-bench_range_distribution!(bench_dist_seq_u64, U64ShredIndex, "sequential");
-bench_range_distribution!(bench_dist_rand_u64, U64ShredIndex, "random");
-bench_range_distribution!(bench_dist_clust_u64, U64ShredIndex, "clustered");
+// bench_range_distribution!(bench_dist_seq_u64, U64ShredIndex, "sequential");
+// bench_range_distribution!(bench_dist_rand_u64, U64ShredIndex, "random");
+// bench_range_distribution!(bench_dist_clust_u64, U64ShredIndex, "clustered");
 
-// Insertion pattern benchmarks for each implementation
-bench_insert_pattern!(bench_insert_seq_byte, ByteShredIndex, "sequential");
-bench_insert_pattern!(bench_insert_rand_byte, ByteShredIndex, "random");
-bench_insert_pattern!(bench_insert_clust_byte, ByteShredIndex, "clustered");
+// // Insertion pattern benchmarks for each implementation
+// bench_insert_pattern!(bench_insert_seq_byte, ByteShredIndex, "sequential");
+// bench_insert_pattern!(bench_insert_rand_byte, ByteShredIndex, "random");
+// bench_insert_pattern!(bench_insert_clust_byte, ByteShredIndex, "clustered");
 
-bench_insert_pattern!(bench_insert_seq_bit_array, BitArrayShredIndex, "sequential");
-bench_insert_pattern!(bench_insert_rand_bit_array, BitArrayShredIndex, "random");
-bench_insert_pattern!(
-    bench_insert_clust_bit_array,
-    BitArrayShredIndex,
-    "clustered"
-);
+// bench_insert_pattern!(bench_insert_seq_bit_array, BitArrayShredIndex, "sequential");
+// bench_insert_pattern!(bench_insert_rand_bit_array, BitArrayShredIndex, "random");
+// bench_insert_pattern!(
+//     bench_insert_clust_bit_array,
+//     BitArrayShredIndex,
+//     "clustered"
+// );
 
-bench_insert_pattern!(bench_insert_seq_legacy, LegacyShredIndex, "sequential");
-bench_insert_pattern!(bench_insert_rand_legacy, LegacyShredIndex, "random");
-bench_insert_pattern!(bench_insert_clust_legacy, LegacyShredIndex, "clustered");
+// bench_insert_pattern!(bench_insert_seq_legacy, LegacyShredIndex, "sequential");
+// bench_insert_pattern!(bench_insert_rand_legacy, LegacyShredIndex, "random");
+// bench_insert_pattern!(bench_insert_clust_legacy, LegacyShredIndex, "clustered");
 
-bench_insert_pattern!(bench_insert_seq_bv, BvShredIndex, "sequential");
-bench_insert_pattern!(bench_insert_rand_bv, BvShredIndex, "random");
-bench_insert_pattern!(bench_insert_clust_bv, BvShredIndex, "clustered");
+// bench_insert_pattern!(bench_insert_seq_bv, BvShredIndex, "sequential");
+// bench_insert_pattern!(bench_insert_rand_bv, BvShredIndex, "random");
+// bench_insert_pattern!(bench_insert_clust_bv, BvShredIndex, "clustered");
 
-bench_insert_pattern!(bench_insert_seq_u64, U64ShredIndex, "sequential");
-bench_insert_pattern!(bench_insert_rand_u64, U64ShredIndex, "random");
-bench_insert_pattern!(bench_insert_clust_u64, U64ShredIndex, "clustered");
+// bench_insert_pattern!(bench_insert_seq_u64, U64ShredIndex, "sequential");
+// bench_insert_pattern!(bench_insert_rand_u64, U64ShredIndex, "random");
+// bench_insert_pattern!(bench_insert_clust_u64, U64ShredIndex, "clustered");
 
 #[cfg(test)]
 mod tests {
