@@ -1,7 +1,7 @@
 [package]
-name = "solana-timings"
-description = "Solana Execution Timings"
-documentation = "https://docs.rs/solana-timings"
+name = "solana-epoch-rewards-hasher"
+description = "Solana epoch rewards hasher."
+documentation = "https://docs.rs/solana-epoch-rewards-hasher"
 version = { workspace = true }
 authors = { workspace = true }
 repository = { workspace = true }
@@ -10,9 +10,12 @@ license = { workspace = true }
 edition = { workspace = true }
 
 [dependencies]
-eager = { workspace = true }
-enum-iterator = { workspace = true }
+siphasher = { workspace = true }
+solana-hash = { workspace = true }
 solana-pubkey = { workspace = true }
 
 [package.metadata.docs.rs]
 targets = ["x86_64-unknown-linux-gnu"]
+
+[lints]
+workspace = true
