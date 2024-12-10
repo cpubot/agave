@@ -7,7 +7,10 @@ use {
     serde::{Deserialize, Serialize},
     serde_with::serde_as,
     solana_ledger::blockstore_meta::ShredIndex as LegacyShredIndex,
-    std::ops::{Bound, RangeBounds},
+    std::{
+        mem::MaybeUninit,
+        ops::{Bound, RangeBounds},
+    },
     test::Bencher,
 };
 
@@ -141,6 +144,7 @@ impl Serialize for U64ShredIndex {
         S: serde::Serializer,
     {
         use serde::ser::SerializeTuple;
+        let mut tuple = serializer.serialize_tuple(2)?;
         // SAFETY: This is safe because:
         // 1. Memory initialization & layout:
         //    - index is a fixed-size array [u64; NUM_U64S] fully initialized
@@ -154,14 +158,24 @@ impl Serialize for U64ShredIndex {
         // 3. Lifetime:
         //    - slice lifetime is tied to &self and is read-only
         //
-        // Note: Deserialization will validate the byte length and safely reconstruct the u64 array
-        let mut tuple = serializer.serialize_tuple(2)?;
-        tuple.serialize_element(&serde_bytes::Bytes::new(unsafe {
-            std::slice::from_raw_parts(
-                &self.index as *const _ as *const u8,
-                std::mem::size_of::<[u64; NUM_U64S]>(),
-            )
-        }))?;
+        // Note: Deserialization will validate the byte length and safely initialize the u64 array
+        #[cfg(target_endian = "little")]
+        {
+            tuple.serialize_element(serde_bytes::Bytes::new(unsafe {
+                std::slice::from_raw_parts(
+                    &self.index as *const _ as *const u8,
+                    std::mem::size_of::<[u64; NUM_U64S]>(),
+                )
+            }))?;
+        }
+        #[cfg(not(target_endian = "little"))]
+        {
+            let mut buffer = [0u8; std::mem::size_of::<[u64; NUM_U64S]>()];
+            for (i, &word) in self.index.iter().enumerate() {
+                buffer[i * 8..(i + 1) * 8].copy_from_slice(&word.to_le_bytes());
+            }
+            tuple.serialize_element(serde_bytes::Bytes::new(&buffer))?;
+        }
         tuple.serialize_element(&self.num_shreds)?;
         tuple.end()
     }
@@ -172,21 +186,58 @@ impl<'de> Deserialize<'de> for U64ShredIndex {
     where
         D: serde::Deserializer<'de>,
     {
-        use serde::de::Error;
-
         let (bytes, num_shreds) = <(&[u8], usize)>::deserialize(deserializer)?;
-
-        if bytes.len() > std::mem::size_of::<[u64; NUM_U64S]>() {
-            return Err(D::Error::custom("input too large"));
+        let total_size = std::mem::size_of::<[u64; NUM_U64S]>();
+        if bytes.len() > total_size {
+            return Err(serde::de::Error::custom("input too large"));
+        }
+        if bytes.is_empty() {
+            return Err(serde::de::Error::custom("input is empty"));
         }
 
-        let mut index = [0u64; NUM_U64S];
-        bytes.chunks_exact(8).enumerate().for_each(|(i, chunk)| {
-            // This is safe because chunks_exact(8) guarantees 8-byte chunks
-            index[i] = u64::from_ne_bytes(chunk.try_into().unwrap());
-        });
+        let mut buffer = MaybeUninit::<[u64; NUM_U64S]>::uninit();
+        let remaining_bytes = total_size - bytes.len();
 
-        Ok(Self { index, num_shreds })
+        // SAFETY: This is safe because:
+        // 1. Memory initialization:
+        //    - We copy `bytes.len()` bytes from input to start of buffer
+        //    - We zero remaining (total_size - bytes.len()) bytes
+        //    - Together these initialize all total_size bytes of buffer
+        //    - total_size is exactly size_of::<[u64; NUM_U64S]>()
+        //
+        // 2. Bounds checking:
+        //    - bytes.len() > 0 (checked above)
+        //    - bytes.len() <= total_size (checked above)
+        //    - remaining_bytes calculation can't underflow due to above check
+        //
+        // 3. Pointer safety:
+        //    - buffer is a fresh MaybeUninit, so copy_nonoverlapping is safe
+        //    - bytes.as_ptr() is valid for bytes.len() (guaranteed by &[u8])
+        //    - add(bytes.len()) is safe as bytes.len() <= total_size
+        //
+        // 4. Alignment:
+        //    - Buffer is u64-aligned due to its type [u64; NUM_U64S]
+        //    - Copying as bytes (*mut u8) has no alignment requirements
+        //    - Final assume_init() is safe as all bytes are initialized
+        unsafe {
+            // Copy input bytes
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                buffer.as_mut_ptr() as *mut u8,
+                bytes.len(),
+            );
+            // Zero remaining bytes
+            std::ptr::write_bytes(
+                (buffer.as_mut_ptr() as *mut u8).add(bytes.len()),
+                0,
+                remaining_bytes,
+            );
+
+            Ok(Self {
+                index: buffer.assume_init(),
+                num_shreds,
+            })
+        }
     }
 }
 
