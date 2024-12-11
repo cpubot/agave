@@ -145,37 +145,42 @@ impl Serialize for U64ShredIndex {
     {
         use serde::ser::SerializeTuple;
         let mut tuple = serializer.serialize_tuple(2)?;
-        // SAFETY: This is safe because:
-        // 1. Memory initialization & layout:
-        //    - index is a fixed-size array [u64; NUM_U64S] fully initialized
-        //      at construction and never contains uninitialized memory
-        //    - array elements are contiguous with no padding
+
+        // SAFETY: This operation is safe because:
         //
-        // 2. Size & alignment:
-        //    - size_of::<[u64; NUM_U64S]> is exactly (8 * NUM_U64S) bytes
-        //    - &self.index is u64-aligned, which satisfies u8 alignment
+        // Purpose:
+        // - Serialize `self.index` (a `[u64; NUM_U64S]` array) into a fixed-size buffer as little-endian bytes.
         //
-        // 3. Lifetime:
-        //    - slice lifetime is tied to &self and is read-only
+        // Memory Layout:
+        // - The buffer is sized to `std::mem::size_of::<[u64; NUM_U64S]>()`, matching the source data size.
+        // - Each `u64` is serialized into 8 bytes, ensuring no padding or overflow.
         //
-        // Note: Deserialization will validate the byte length and safely initialize the u64 array
-        #[cfg(target_endian = "little")]
-        {
-            tuple.serialize_element(serde_bytes::Bytes::new(unsafe {
-                std::slice::from_raw_parts(
-                    &self.index as *const _ as *const u8,
-                    std::mem::size_of::<[u64; NUM_U64S]>(),
-                )
-            }))?;
-        }
-        #[cfg(not(target_endian = "little"))]
-        {
-            let mut buffer = [0u8; std::mem::size_of::<[u64; NUM_U64S]>()];
+        // Pointer Safety:
+        // - `dst` is derived from `buffer.as_mut_ptr()` and points to valid, uninitialized memory.
+        // - The offsets `dst.add(i * 8)` are always within bounds because:
+        //   - `i` ranges from `0` to `NUM_U64S - 1`.
+        //   - The total size of the buffer is sufficient to accommodate all writes.
+        //
+        // Alignment:
+        // - `dst` is `u8`-aligned from `buffer.as_mut_ptr()`.
+        // - Writing 8 bytes per iteration (`[u8; 8]` from `to_le_bytes()`) respects alignment requirements.
+        //
+        // Initialization:
+        // - Each 8-byte chunk is written exactly once using `std::ptr::write`, fully initializing the buffer.
+        // - After the loop, the buffer is guaranteed to be completely initialized, making `assume_init()` safe.
+        //
+        // Notes:
+        // - Serialization uses little-endian order for portability.
+        let buffer = unsafe {
+            let mut buffer = MaybeUninit::<[u8; std::mem::size_of::<[u64; NUM_U64S]>()]>::uninit();
+            let dst = buffer.as_mut_ptr() as *mut u8;
             for (i, &word) in self.index.iter().enumerate() {
-                buffer[i * 8..(i + 1) * 8].copy_from_slice(&word.to_le_bytes());
+                // Explicitly convert to LE bytes
+                std::ptr::write(dst.add(i * 8) as *mut [u8; 8], word.to_le_bytes());
             }
-            tuple.serialize_element(serde_bytes::Bytes::new(&buffer))?;
-        }
+            buffer.assume_init()
+        };
+        tuple.serialize_element(serde_bytes::Bytes::new(&buffer))?;
         tuple.serialize_element(&self.num_shreds)?;
         tuple.end()
     }
@@ -200,8 +205,8 @@ impl<'de> Deserialize<'de> for U64ShredIndex {
 
         // SAFETY: This is safe because:
         // 1. Memory initialization:
-        //    - We copy `bytes.len()` bytes from input to start of buffer
-        //    - We zero remaining (total_size - bytes.len()) bytes
+        //    - We write bytes in 8-byte chunks using from_le_bytes
+        //    - We zero remaining bytes
         //    - Together these initialize all total_size bytes of buffer
         //    - total_size is exactly size_of::<[u64; NUM_U64S]>()
         //
@@ -211,21 +216,25 @@ impl<'de> Deserialize<'de> for U64ShredIndex {
         //    - remaining_bytes calculation can't underflow due to above check
         //
         // 3. Pointer safety:
-        //    - buffer is a fresh MaybeUninit, so copy_nonoverlapping is safe
-        //    - bytes.as_ptr() is valid for bytes.len() (guaranteed by &[u8])
-        //    - add(bytes.len()) is safe as bytes.len() <= total_size
+        //    - buffer is a fresh MaybeUninit
+        //    - chunks_exact(8) ensures safe byte access
+        //    - ptr.add(i) is safe as i is bounded by bytes.len()/8
+        //    - write_bytes only writes to remaining uninitialized space
         //
         // 4. Alignment:
         //    - Buffer is u64-aligned due to its type [u64; NUM_U64S]
-        //    - Copying as bytes (*mut u8) has no alignment requirements
         //    - Final assume_init() is safe as all bytes are initialized
         unsafe {
-            // Copy input bytes
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                buffer.as_mut_ptr() as *mut u8,
-                bytes.len(),
-            );
+            let ptr = buffer.as_mut_ptr() as *mut u64;
+            // Copy input bytes, converting to LE.
+            bytes.chunks_exact(8).enumerate().for_each(|(i, byte)| {
+                std::ptr::write(
+                    ptr.add(i),
+                    // SAFETY: chunks_exact(8) guarantees 8 bytes.
+                    u64::from_le_bytes(byte.try_into().unwrap_unchecked()),
+                );
+            });
+
             // Zero remaining bytes
             std::ptr::write_bytes(
                 (buffer.as_mut_ptr() as *mut u8).add(bytes.len()),
