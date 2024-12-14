@@ -144,6 +144,30 @@ impl From<Index> for IndexV2 {
     }
 }
 
+impl IndexV2 {
+    pub(crate) fn new(slot: Slot) -> Self {
+        IndexV2 {
+            slot,
+            data: ShredIndexV2::default(),
+            coding: ShredIndexV2::default(),
+        }
+    }
+
+    pub fn data(&self) -> &ShredIndexV2 {
+        &self.data
+    }
+    pub fn coding(&self) -> &ShredIndexV2 {
+        &self.coding
+    }
+
+    pub(crate) fn data_mut(&mut self) -> &mut ShredIndexV2 {
+        &mut self.data
+    }
+    pub(crate) fn coding_mut(&mut self) -> &mut ShredIndexV2 {
+        &mut self.coding
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ShredIndex {
     /// Map representing presence/absence of shreds
@@ -258,6 +282,7 @@ pub struct FrozenHashStatus {
     pub is_duplicate_confirmed: bool,
 }
 
+#[allow(unused)]
 impl Index {
     pub(crate) fn new(slot: Slot) -> Self {
         Index {
@@ -286,6 +311,7 @@ impl Index {
 ///
 /// TODO: Remove this once new [`ShredIndexV2`] is fully rolled out
 /// and no longer relies on it for fallback.
+#[allow(unused)]
 impl ShredIndex {
     pub fn num_shreds(&self) -> usize {
         self.index.len()
@@ -831,7 +857,7 @@ impl ErasureMeta {
         self.fec_set_index.checked_add(num_data)
     }
 
-    pub(crate) fn status(&self, index: &Index) -> ErasureMetaStatus {
+    pub(crate) fn status(&self, index: &IndexV2) -> ErasureMetaStatus {
         use ErasureMetaStatus::*;
 
         let num_coding = index.coding().range(self.coding_shreds_indices()).count();
@@ -1007,7 +1033,7 @@ mod test {
             first_received_coding_index: 0,
         };
         let mut rng = thread_rng();
-        let mut index = Index::new(0);
+        let mut index = IndexV2::new(0);
 
         let data_indexes = 0..erasure_config.num_data as u64;
         let coding_indexes = 0..erasure_config.num_coding as u64;
