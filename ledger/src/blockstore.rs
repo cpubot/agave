@@ -4811,7 +4811,7 @@ fn update_completed_data_indexes(
         .filter(|ix| {
             let (begin, end) = (ix[0] as u64, ix[1] as u64);
             let num_shreds = (end - begin) as usize;
-            received_data_shreds.range(begin..end).count() == num_shreds
+            received_data_shreds.count_ones(begin..end) == num_shreds
         })
         .map(|ix| (ix[0], ix[1] - 1))
         .collect()

@@ -13,6 +13,11 @@ edition = { workspace = true }
 assert_matches = { workspace = true }
 bincode = { workspace = true }
 bitflags = { workspace = true, features = ["serde"] }
+bytemuck = { workspace = true, features = [
+    "derive",
+    "min_const_generics",
+    "align_offset",
+] }
 byteorder = { workspace = true }
 bzip2 = { workspace = true }
 chrono = { workspace = true, features = ["default", "serde"] }
@@ -31,6 +36,8 @@ lru = { workspace = true }
 mockall = { workspace = true }
 num_cpus = { workspace = true }
 num_enum = { workspace = true }
+num-traits = { workspace = true }
+proptest = { workspace = true }
 prost = { workspace = true }
 qualifier_attr = { workspace = true }
 rand = { workspace = true }

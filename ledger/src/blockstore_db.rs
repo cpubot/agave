@@ -9,8 +9,9 @@ use {
             PERF_METRIC_OP_NAME_WRITE_BATCH,
         },
         blockstore_options::{AccessType, BlockstoreOptions, LedgerColumnOptions},
+        to_from_bytes::{self, ToFromBytes},
     },
-    bincode::{deserialize, serialize},
+    bincode::deserialize,
     byteorder::{BigEndian, ByteOrder},
     log::*,
     prost::Message,
@@ -22,7 +23,7 @@ use {
         DBCompressionType, DBIterator, DBPinnableSlice, DBRawIterator,
         IteratorMode as RocksIteratorMode, LiveFile, Options, WriteBatch as RWriteBatch, DB,
     },
-    serde::{de::DeserializeOwned, Serialize},
+    serde::de::DeserializeOwned,
     solana_accounts_db::hardened_unpack::UnpackError,
     solana_sdk::{
         clock::{Slot, UnixTimestamp},
@@ -158,6 +159,10 @@ pub enum BlockstoreError {
     LegacyShred(Slot, u64),
     #[error("unable to read merkle root slot {0}, index {1}")]
     MissingMerkleRoot(Slot, u64),
+    #[error("to from bytes error: {0}")]
+    ToFromBytes(#[from] crate::to_from_bytes::Error),
+    #[error("invalid shred index > MAX_DATA_SHREDS_PER_SLOT")]
+    InvalidShredIndex,
 }
 pub type Result<T> = std::result::Result<T, BlockstoreError>;
 
@@ -794,10 +799,19 @@ pub trait ColumnName {
 }
 
 pub trait TypedColumn: Column {
-    type Type: Serialize + DeserializeOwned;
+    type Type: ToFromBytes;
 
-    fn deserialize(data: &[u8]) -> bincode::Result<Self::Type> {
-        bincode::deserialize(data)
+    #[inline(always)]
+    fn deserialize(data: &[u8]) -> Result<Self::Type> {
+        Ok(Self::Type::from_bytes(data)?)
+    }
+
+    #[inline(always)]
+    fn serialize_into<F, R>(t: &Self::Type, f: F) -> Result<R>
+    where
+        F: FnOnce(&[u8]) -> R,
+    {
+        Ok(t.to_bytes(f)?)
     }
 }
 
@@ -1214,7 +1228,8 @@ impl ColumnName for columns::Index {
 impl TypedColumn for columns::Index {
     type Type = blockstore_meta::Index;
 
-    fn deserialize(data: &[u8]) -> bincode::Result<Self::Type> {
+    #[inline(always)]
+    fn deserialize(data: &[u8]) -> Result<Self::Type> {
         // Migration strategy for new column format:
         // 1. Release 1: Add ability to read new format as fallback, keep writing old format
         // 2. Release 2: Switch to writing new format, keep reading old format as fallback
@@ -1228,12 +1243,15 @@ impl TypedColumn for columns::Index {
         // For example, serializing two `u64`s:
         // - ShredIndexV2 serializes as a collection of bytes, with a length prefix of 16.
         // - ShredIndex serializes as a collection of u64s, with a length prefix of 2.
-        let index: bincode::Result<blockstore_meta::Index> = bincode::deserialize(data);
+        let index: to_from_bytes::Result<blockstore_meta::IndexV2> =
+            blockstore_meta::IndexV2::from_bytes(data);
         match index {
             Ok(index) => Ok(index),
             Err(_) => {
-                let index: blockstore_meta::IndexV2 = bincode::deserialize(data)?;
-                Ok(index.into())
+                let index: blockstore_meta::IndexLegacy = ToFromBytes::from_bytes(data)?;
+                index
+                    .try_into()
+                    .map_err(|_| BlockstoreError::InvalidShredIndex)
             }
         }
     }
@@ -1674,7 +1692,7 @@ where
             let result = self
                 .backend
                 .multi_get_cf(self.handle(), &keys)
-                .map(|out| Ok(out?.as_deref().map(C::deserialize).transpose()?))
+                .map(|out| out?.as_deref().map(C::deserialize).transpose())
                 .collect::<Vec<Result<Option<_>>>>();
             if let Some(op_start_instant) = is_perf_enabled {
                 // use multi-get instead
@@ -1722,10 +1740,11 @@ where
             self.column_options.rocks_perf_sample_interval,
             &self.write_perf_status,
         );
-        let serialized_value = serialize(value)?;
 
         let key = Self::key_from_index(index);
-        let result = self.backend.put_cf(self.handle(), &key, &serialized_value);
+        let result = C::serialize_into(value, |bytes| {
+            self.backend.put_cf(self.handle(), &key, bytes)
+        })?;
 
         if let Some(op_start_instant) = is_perf_enabled {
             report_rocksdb_write_perf(
@@ -1745,8 +1764,7 @@ where
         value: &C::Type,
     ) -> Result<()> {
         let key = Self::key_from_index(index);
-        let serialized_value = serialize(value)?;
-        batch.put_cf(self.handle(), &key, &serialized_value)
+        C::serialize_into(value, |bytes| batch.put_cf(self.handle(), &key, bytes))?
     }
 }
 
@@ -2267,9 +2285,10 @@ pub mod tests {
         C: ColumnIndexDeprecation + TypedColumn + ColumnName,
     {
         pub fn put_deprecated(&self, index: C::DeprecatedIndex, value: &C::Type) -> Result<()> {
-            let serialized_value = serialize(value)?;
-            self.backend
-                .put_cf(self.handle(), &C::deprecated_key(index), &serialized_value)
+            C::serialize_into(value, |bytes| {
+                self.backend
+                    .put_cf(self.handle(), &C::deprecated_key(index), bytes)
+            })?
         }
     }
 
