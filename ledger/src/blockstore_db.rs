@@ -1708,6 +1708,7 @@ where
         }
     }
 
+    #[inline(always)]
     pub fn get(&self, index: C::Index) -> Result<Option<C::Type>> {
         let key = Self::key_from_index(index);
         self.get_raw(&key)

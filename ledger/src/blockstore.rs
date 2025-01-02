@@ -2489,6 +2489,7 @@ impl Blockstore {
         Ok(num_data)
     }
 
+    #[inline(always)]
     pub fn get_index(&self, slot: Slot) -> Result<Option<Index>> {
         self.index_cf.get(slot)
     }
