@@ -9,7 +9,7 @@ use {
             PERF_METRIC_OP_NAME_WRITE_BATCH,
         },
         blockstore_options::{AccessType, BlockstoreOptions, LedgerColumnOptions},
-        to_from_bytes::{self, ToFromBytes},
+        to_from_bytes::ToFromBytes,
     },
     bincode::deserialize,
     byteorder::{BigEndian, ByteOrder},
@@ -1227,34 +1227,6 @@ impl ColumnName for columns::Index {
 }
 impl TypedColumn for columns::Index {
     type Type = blockstore_meta::Index;
-
-    #[inline(always)]
-    fn deserialize(data: &[u8]) -> Result<Self::Type> {
-        // Migration strategy for new column format:
-        // 1. Release 1: Add ability to read new format as fallback, keep writing old format
-        // 2. Release 2: Switch to writing new format, keep reading old format as fallback
-        // 3. Release 3: Remove old format support once stable
-        // This allows safe downgrade to Release 1 since it can read both formats
-        // https://github.com/anza-xyz/agave/issues/3570
-
-        // Version compatibility note: Index and IndexV2 use different serialization
-        // strategies in their ShredIndex field that make their formats naturally distinguishable.
-        //
-        // For example, serializing two `u64`s:
-        // - ShredIndexV2 serializes as a collection of bytes, with a length prefix of 16.
-        // - ShredIndex serializes as a collection of u64s, with a length prefix of 2.
-        let index: to_from_bytes::Result<blockstore_meta::IndexV2> =
-            blockstore_meta::IndexV2::from_bytes(data);
-        match index {
-            Ok(index) => Ok(index),
-            Err(_) => {
-                let index: blockstore_meta::IndexLegacy = ToFromBytes::from_bytes(data)?;
-                index
-                    .try_into()
-                    .map_err(|_| BlockstoreError::InvalidShredIndex)
-            }
-        }
-    }
 }
 
 impl SlotColumn for columns::DeadSlots {}
@@ -1714,16 +1686,18 @@ where
         self.get_raw(&key)
     }
 
+    #[inline(always)]
     pub fn get_raw(&self, key: &[u8]) -> Result<Option<C::Type>> {
-        let mut result = Ok(None);
         let is_perf_enabled = maybe_enable_rocksdb_perf(
             self.column_options.rocks_perf_sample_interval,
             &self.read_perf_status,
         );
-        if let Some(pinnable_slice) = self.backend.get_pinned_cf(self.handle(), key)? {
-            let value = C::deserialize(pinnable_slice.as_ref())?;
-            result = Ok(Some(value))
-        }
+
+        let result = if let Some(pinnable_slice) = self.backend.get_pinned_cf(self.handle(), key)? {
+            C::deserialize(pinnable_slice.as_ref()).map(Some)
+        } else {
+            Ok(None)
+        };
 
         if let Some(op_start_instant) = is_perf_enabled {
             report_rocksdb_read_perf(
