@@ -659,6 +659,7 @@ impl Rocks {
         Ok(opt)
     }
 
+    #[inline(always)]
     fn get_pinned_cf(&self, cf: &ColumnFamily, key: &[u8]) -> Result<Option<DBPinnableSlice>> {
         let opt = self.db.get_pinned_cf(cf, key)?;
         Ok(opt)
