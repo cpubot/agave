@@ -166,7 +166,7 @@ fn bench_retransmitter(bencher: &mut Bencher) {
             shred.set_index(index);
             index += 1;
             index %= 200;
-            let shred = shred.payload().clone();
+            let shred = shred.payload().to_vec();
             let _ = shreds_sender.send(vec![shred]);
         }
         slot += 1;

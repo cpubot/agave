@@ -275,7 +275,7 @@ mod tests {
         let chunks = from_shred(
             shred1,
             sender,
-            shred2.payload().clone(),
+            shred2.payload().to_vec(),
             None::<fn(Slot) -> Option<Pubkey>>,
             timestamp(), // wallclock
             chunk_size,  // max_size

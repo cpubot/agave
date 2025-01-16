@@ -978,7 +978,7 @@ fn do_blockstore_process_command(ledger_path: &Path, matches: &ArgMatches<'_>) -
                 code: bool,
                 last_in_slot: bool,
                 data_complete: bool,
-                shred: &'a Shred,
+                shred: &'a Shred<'a>,
             }
             let starting_slot = value_t_or_exit!(arg_matches, "starting_slot", Slot);
             let ending_slot = value_t!(arg_matches, "ending_slot", Slot).unwrap_or(Slot::MAX);

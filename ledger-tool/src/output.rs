@@ -33,6 +33,7 @@ use {
         VersionedTransactionWithStatusMeta,
     },
     std::{
+        borrow::Cow,
         cell::RefCell,
         collections::HashMap,
         fmt::{self, Display, Formatter},
@@ -337,8 +338,8 @@ impl fmt::Display for CliDuplicateSlotProof {
 
 impl From<DuplicateSlotProof> for CliDuplicateSlotProof {
     fn from(proof: DuplicateSlotProof) -> Self {
-        let shred1 = Shred::new_from_serialized_shred(proof.shred1).unwrap();
-        let shred2 = Shred::new_from_serialized_shred(proof.shred2).unwrap();
+        let shred1 = Shred::new_from_serialized_shred(Cow::Owned(proof.shred1)).unwrap();
+        let shred2 = Shred::new_from_serialized_shred(Cow::Owned(proof.shred2)).unwrap();
         let erasure_consistency = (shred1.shred_type() == ShredType::Code
             && shred2.shred_type() == ShredType::Code)
             .then(|| ErasureMeta::check_erasure_consistency(&shred1, &shred2));
@@ -397,8 +398,8 @@ impl fmt::Display for CliDuplicateShred {
     }
 }
 
-impl From<Shred> for CliDuplicateShred {
-    fn from(shred: Shred) -> Self {
+impl<'a> From<Shred<'a>> for CliDuplicateShred {
+    fn from(shred: Shred<'a>) -> Self {
         Self {
             fec_set_index: shred.fec_set_index(),
             index: shred.index(),
@@ -407,7 +408,7 @@ impl From<Shred> for CliDuplicateShred {
             merkle_root: shred.merkle_root().ok(),
             chained_merkle_root: shred.chained_merkle_root().ok(),
             last_in_slot: shred.last_in_slot(),
-            payload: shred.payload().clone(),
+            payload: shred.payload().to_vec(),
         }
     }
 }

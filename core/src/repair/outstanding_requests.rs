@@ -11,9 +11,9 @@ pub struct OutstandingRequests<T> {
     requests: LruCache<Nonce, RequestStatus<T>>,
 }
 
-impl<T, S> OutstandingRequests<T>
+impl<'a, T> OutstandingRequests<T>
 where
-    T: RequestResponse<Response = S>,
+    T: RequestResponse<'a>,
 {
     // Returns boolean indicating whether sufficient time has passed for a request with
     // the given timestamp to be made
@@ -34,7 +34,7 @@ where
     pub fn register_response<R>(
         &mut self,
         nonce: u32,
-        response: &S,
+        response: &T::Response,
         now: u64,
         // runs if the response was valid
         success_fn: impl Fn(&T) -> R,

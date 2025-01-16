@@ -12,6 +12,7 @@ use {
     },
     solana_perf::test_tx,
     solana_sdk::{hash::Hash, signature::Keypair},
+    std::borrow::Cow,
     test::Bencher,
 };
 
@@ -28,7 +29,7 @@ fn make_large_unchained_entries(txs_per_entry: u64, num_entries: u64) -> Vec<Ent
         .collect()
 }
 
-fn make_shreds(num_shreds: usize) -> Vec<Shred> {
+fn make_shreds(num_shreds: usize) -> Vec<Shred<'static>> {
     let txs_per_entry = 128;
     let num_entries = max_entries_per_n_shred(
         &make_test_entry(txs_per_entry),
@@ -144,8 +145,7 @@ fn bench_deserialize_hdr(bencher: &mut Bencher) {
     let shred = Shred::new_from_data(2, 1, 1, &data, ShredFlags::LAST_SHRED_IN_SLOT, 0, 0, 1);
 
     bencher.iter(|| {
-        let payload = shred.payload().clone();
-        let _ = Shred::new_from_serialized_shred(payload).unwrap();
+        let _ = Shred::new_from_serialized_shred(Cow::Borrowed(shred.payload())).unwrap();
     })
 }
 

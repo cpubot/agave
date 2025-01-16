@@ -13,7 +13,7 @@ pub const SLOT_TO_RESOLVE: u64 = 32;
 #[derive(Clone)]
 pub(super) struct FailEntryVerificationBroadcastRun {
     shred_version: u16,
-    good_shreds: Vec<Shred>,
+    good_shreds: Vec<Shred<'static>>,
     current_slot: Slot,
     chained_merkle_root: Hash,
     next_shred_index: u32,

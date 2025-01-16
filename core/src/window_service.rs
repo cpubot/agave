@@ -37,6 +37,7 @@ use {
     },
     solana_turbine::cluster_nodes,
     std::{
+        borrow::Cow,
         cmp::Reverse,
         collections::{HashMap, HashSet},
         net::{SocketAddr, UdpSocket},
@@ -284,7 +285,7 @@ fn run_insert<F>(
     accept_repairs_only: bool,
 ) -> Result<()>
 where
-    F: Fn(PossibleDuplicateShred),
+    F: Fn(PossibleDuplicateShred<'static>),
 {
     const RECV_TIMEOUT: Duration = Duration::from_millis(200);
     let mut shred_receiver_elapsed = Measure::start("shred_receiver_elapsed");
@@ -293,12 +294,12 @@ where
     shred_receiver_elapsed.stop();
     ws_metrics.shred_receiver_elapsed_us += shred_receiver_elapsed.as_us();
     ws_metrics.run_insert_count += 1;
-    let handle_packet = |packet: &Packet| {
+    fn handle_packet(packet: &Packet) -> Option<(Shred<'_>, Option<RepairMeta>)> {
         if packet.meta().discard() {
             return None;
         }
         let shred = shred::layout::get_shred(packet)?;
-        let shred = Shred::new_from_serialized_shred(shred.to_vec()).ok()?;
+        let shred = Shred::new_from_serialized_shred(Cow::Borrowed(shred)).ok()?;
         if packet.meta().repair() {
             let repair_info = RepairMeta {
                 // If can't parse the nonce, dump the packet.
@@ -308,7 +309,7 @@ where
         } else {
             Some((shred, None))
         }
-    };
+    }
     let now = Instant::now();
     let (mut shreds, mut repair_infos): (Vec<_>, Vec<_>) = thread_pool.install(|| {
         packets
@@ -449,7 +450,7 @@ impl WindowService {
         cluster_info: Arc<ClusterInfo>,
         exit: Arc<AtomicBool>,
         blockstore: Arc<Blockstore>,
-        duplicate_receiver: Receiver<PossibleDuplicateShred>,
+        duplicate_receiver: Receiver<PossibleDuplicateShred<'static>>,
         duplicate_slots_sender: DuplicateSlotSender,
         bank_forks: Arc<RwLock<BankForks>>,
     ) -> JoinHandle<()> {
@@ -481,7 +482,7 @@ impl WindowService {
         blockstore: Arc<Blockstore>,
         leader_schedule_cache: Arc<LeaderScheduleCache>,
         verified_receiver: Receiver<Vec<PacketBatch>>,
-        check_duplicate_sender: Sender<PossibleDuplicateShred>,
+        check_duplicate_sender: Sender<PossibleDuplicateShred<'static>>,
         completed_data_sets_sender: Option<CompletedDataSetsSender>,
         retransmit_sender: Sender<Vec<ShredPayload>>,
         outstanding_requests: Arc<RwLock<OutstandingShredRepairs>>,
@@ -593,7 +594,7 @@ mod test {
         slot: Slot,
         parent: Slot,
         keypair: &Keypair,
-    ) -> Vec<Shred> {
+    ) -> Vec<Shred<'static>> {
         let shredder = Shredder::new(slot, parent, 0, 0).unwrap();
         let (data_shreds, _) = shredder.entries_to_shreds(
             keypair,

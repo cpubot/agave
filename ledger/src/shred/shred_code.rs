@@ -16,12 +16,22 @@ pub const MAX_CODE_SHREDS_PER_SLOT: usize = MAX_DATA_SHREDS_PER_SLOT;
 const_assert_eq!(ShredCode::SIZE_OF_PAYLOAD, 1228);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ShredCode {
-    Legacy(legacy::ShredCode),
-    Merkle(merkle::ShredCode),
+pub enum ShredCode<'a> {
+    Legacy(legacy::ShredCode<'a>),
+    Merkle(merkle::ShredCode<'a>),
 }
 
-impl ShredCode {
+impl ShredCode<'_> {
+    #[inline(always)]
+    pub fn into_owned(self) -> ShredCode<'static> {
+        match self {
+            ShredCode::Legacy(shred) => ShredCode::Legacy(shred.into_owned()),
+            ShredCode::Merkle(shred) => ShredCode::Merkle(shred.into_owned()),
+        }
+    }
+}
+
+impl<'a> ShredCode<'a> {
     pub(super) const SIZE_OF_PAYLOAD: usize = PACKET_DATA_SIZE - SIZE_OF_NONCE;
 
     dispatch!(fn coding_header(&self) -> &CodingShredHeader);
@@ -32,7 +42,7 @@ impl ShredCode {
     dispatch!(pub(super) fn erasure_shard_index(&self) -> Result<usize, Error>);
     dispatch!(pub(super) fn first_coding_index(&self) -> Option<u32>);
     dispatch!(pub(super) fn into_payload(self) -> Vec<u8>);
-    dispatch!(pub(super) fn payload(&self) -> &Vec<u8>);
+    dispatch!(pub(super) fn payload(&self) -> &[u8]);
     dispatch!(pub(super) fn sanitize(&self) -> Result<(), Error>);
     dispatch!(pub(super) fn set_signature(&mut self, signature: Signature));
 
@@ -92,7 +102,7 @@ impl ShredCode {
     }
 
     // Returns true if the erasure coding of the two shreds mismatch.
-    pub(super) fn erasure_mismatch(&self, other: &ShredCode) -> bool {
+    pub(super) fn erasure_mismatch(&self, other: &ShredCode<'a>) -> bool {
         match (self, other) {
             (Self::Legacy(shred), Self::Legacy(other)) => erasure_mismatch(shred, other),
             (Self::Legacy(_), Self::Merkle(_)) => true,
@@ -115,20 +125,20 @@ impl ShredCode {
     }
 }
 
-impl From<legacy::ShredCode> for ShredCode {
-    fn from(shred: legacy::ShredCode) -> Self {
+impl<'a> From<legacy::ShredCode<'a>> for ShredCode<'a> {
+    fn from(shred: legacy::ShredCode<'a>) -> Self {
         Self::Legacy(shred)
     }
 }
 
-impl From<merkle::ShredCode> for ShredCode {
-    fn from(shred: merkle::ShredCode) -> Self {
+impl<'a> From<merkle::ShredCode<'a>> for ShredCode<'a> {
+    fn from(shred: merkle::ShredCode<'a>) -> Self {
         Self::Merkle(shred)
     }
 }
 
 #[inline]
-pub(super) fn erasure_shard_index<T: ShredCodeTrait>(shred: &T) -> Option<usize> {
+pub(super) fn erasure_shard_index<'a, T: ShredCodeTrait<'a>>(shred: &T) -> Option<usize> {
     // Assert that the last shred index in the erasure set does not
     // overshoot MAX_{DATA,CODE}_SHREDS_PER_SLOT.
     let common_header = shred.common_header();
@@ -155,7 +165,7 @@ pub(super) fn erasure_shard_index<T: ShredCodeTrait>(shred: &T) -> Option<usize>
     (index < fec_set_size).then_some(index)
 }
 
-pub(super) fn sanitize<T: ShredCodeTrait>(shred: &T) -> Result<(), Error> {
+pub(super) fn sanitize<'a, T: ShredCodeTrait<'a>>(shred: &'a T) -> Result<(), Error> {
     if shred.payload().len() != T::SIZE_OF_PAYLOAD {
         return Err(Error::InvalidPayloadSize(shred.payload().len()));
     }
@@ -178,7 +188,7 @@ pub(super) fn sanitize<T: ShredCodeTrait>(shred: &T) -> Result<(), Error> {
     Ok(())
 }
 
-pub(super) fn erasure_mismatch<T: ShredCodeTrait>(shred: &T, other: &T) -> bool {
+pub(super) fn erasure_mismatch<'a, T: ShredCodeTrait<'a>>(shred: &T, other: &T) -> bool {
     let CodingShredHeader {
         num_data_shreds,
         num_coding_shreds,

@@ -9,6 +9,7 @@ use {
     solana_sanitize::{Sanitize, SanitizeError},
     solana_sdk::{clock::Slot, pubkey::Pubkey},
     std::{
+        borrow::Cow,
         collections::{hash_map::Entry, HashMap},
         convert::TryFrom,
         num::TryFromIntError,
@@ -213,10 +214,10 @@ pub(crate) fn from_shred<F>(
 where
     F: FnOnce(Slot) -> Option<Pubkey>,
 {
-    if shred.payload() == &other_payload {
+    if shred.payload() == other_payload {
         return Err(Error::InvalidDuplicateShreds);
     }
-    let other_shred = Shred::new_from_serialized_shred(other_payload)?;
+    let other_shred = Shred::new_from_serialized_shred(Cow::Owned(other_payload))?;
     check_shreds(leader_schedule, &shred, &other_shred, shred_version)?;
     let slot = shred.slot();
     let proof = DuplicateSlotProof {
@@ -304,8 +305,8 @@ pub(crate) fn into_shreds(
     if proof.shred1 == proof.shred2 {
         return Err(Error::InvalidDuplicateSlotProof);
     }
-    let shred1 = Shred::new_from_serialized_shred(proof.shred1)?;
-    let shred2 = Shred::new_from_serialized_shred(proof.shred2)?;
+    let shred1 = Shred::new_from_serialized_shred(Cow::Owned(proof.shred1))?;
+    let shred2 = Shred::new_from_serialized_shred(Cow::Owned(proof.shred2))?;
 
     if shred1.slot() != slot || shred2.slot() != slot {
         Err(Error::SlotMismatch)
@@ -373,7 +374,7 @@ pub(crate) mod tests {
         next_shred_index: u32,
         shredder: &Shredder,
         keypair: &Keypair,
-    ) -> Shred {
+    ) -> Shred<'static> {
         let (mut data_shreds, _) = new_rand_shreds(
             rng,
             next_shred_index,
@@ -394,7 +395,7 @@ pub(crate) mod tests {
         keypair: &Keypair,
         merkle_variant: bool,
         is_last_in_slot: bool,
-    ) -> Shred {
+    ) -> Shred<'static> {
         let (mut data_shreds, _) = new_rand_shreds(
             rng,
             next_shred_index,
@@ -415,7 +416,7 @@ pub(crate) mod tests {
         shredder: &Shredder,
         keypair: &Keypair,
         merkle_variant: bool,
-    ) -> Vec<Shred> {
+    ) -> Vec<Shred<'static>> {
         let (_, coding_shreds) = new_rand_shreds(
             rng,
             next_shred_index,
@@ -438,7 +439,7 @@ pub(crate) mod tests {
         shredder: &Shredder,
         keypair: &Keypair,
         is_last_in_slot: bool,
-    ) -> (Vec<Shred>, Vec<Shred>) {
+    ) -> (Vec<Shred<'static>>, Vec<Shred<'static>>) {
         let entries: Vec<_> = std::iter::repeat_with(|| {
             let tx = system_transaction::transfer(
                 &Keypair::new(),       // from
@@ -534,7 +535,7 @@ pub(crate) mod tests {
         let chunks: Vec<_> = from_shred(
             shred1.clone(),
             Pubkey::new_unique(), // self_pubkey
-            shred2.payload().clone(),
+            shred2.payload().to_vec(),
             Some(leader_schedule),
             rng.gen(), // wallclock
             512,       // max_size
@@ -543,7 +544,8 @@ pub(crate) mod tests {
         .unwrap()
         .collect();
         assert!(chunks.len() > 4);
-        let (shred3, shred4) = into_shreds(&leader.pubkey(), chunks, version).unwrap();
+        let pubkey = leader.pubkey();
+        let (shred3, shred4) = into_shreds(&pubkey, chunks, version).unwrap();
         assert_eq!(shred1, shred3);
         assert_eq!(shred2, shred4);
     }
@@ -590,7 +592,7 @@ pub(crate) mod tests {
                 from_shred(
                     shred1.clone(),
                     Pubkey::new_unique(), // self_pubkey
-                    shred2.payload().clone(),
+                    shred2.payload().to_vec(),
                     Some(leader_schedule),
                     rng.gen(), // wallclock
                     512,       // max_size
@@ -680,7 +682,7 @@ pub(crate) mod tests {
             let chunks: Vec<_> = from_shred(
                 shred1.clone(),
                 Pubkey::new_unique(), // self_pubkey
-                shred2.payload().clone(),
+                shred2.payload().to_vec(),
                 Some(leader_schedule),
                 rng.gen(), // wallclock
                 512,       // max_size
@@ -689,7 +691,8 @@ pub(crate) mod tests {
             .unwrap()
             .collect();
             assert!(chunks.len() > 4);
-            let (shred3, shred4) = into_shreds(&leader.pubkey(), chunks, version).unwrap();
+            let pubkey = leader.pubkey();
+            let (shred3, shred4) = into_shreds(&pubkey, chunks, version).unwrap();
             assert_eq!(shred1, &shred3);
             assert_eq!(shred2, &shred4);
         }
@@ -789,7 +792,7 @@ pub(crate) mod tests {
                 from_shred(
                     shred1.clone(),
                     Pubkey::new_unique(), // self_pubkey
-                    shred2.payload().clone(),
+                    shred2.payload().to_vec(),
                     Some(leader_schedule),
                     rng.gen(), // wallclock
                     512,       // max_size
@@ -869,7 +872,7 @@ pub(crate) mod tests {
             let chunks: Vec<_> = from_shred(
                 shred1.clone(),
                 Pubkey::new_unique(), // self_pubkey
-                shred2.payload().clone(),
+                shred2.payload().to_vec(),
                 Some(leader_schedule),
                 rng.gen(), // wallclock
                 512,       // max_size
@@ -878,7 +881,8 @@ pub(crate) mod tests {
             .unwrap()
             .collect();
             assert!(chunks.len() > 4);
-            let (shred3, shred4) = into_shreds(&leader.pubkey(), chunks, version).unwrap();
+            let pubkey = leader.pubkey();
+            let (shred3, shred4) = into_shreds(&pubkey, chunks, version).unwrap();
             assert_eq!(shred1, shred3);
             assert_eq!(shred2, shred4);
         }
@@ -951,7 +955,7 @@ pub(crate) mod tests {
                 from_shred(
                     shred1.clone(),
                     Pubkey::new_unique(), // self_pubkey
-                    shred2.payload().clone(),
+                    shred2.payload().to_vec(),
                     Some(leader_schedule),
                     rng.gen(), // wallclock
                     512,       // max_size
@@ -1045,7 +1049,7 @@ pub(crate) mod tests {
             let chunks: Vec<_> = from_shred(
                 shred1.clone(),
                 Pubkey::new_unique(), // self_pubkey
-                shred2.payload().clone(),
+                shred2.payload().to_vec(),
                 Some(leader_schedule),
                 rng.gen(), // wallclock
                 512,       // max_size
@@ -1054,7 +1058,8 @@ pub(crate) mod tests {
             .unwrap()
             .collect();
             assert!(chunks.len() > 4);
-            let (shred3, shred4) = into_shreds(&leader.pubkey(), chunks, version).unwrap();
+            let pubkey = leader.pubkey();
+            let (shred3, shred4) = into_shreds(&pubkey, chunks, version).unwrap();
             assert_eq!(shred1, shred3);
             assert_eq!(shred2, shred4);
         }
@@ -1137,7 +1142,7 @@ pub(crate) mod tests {
                 from_shred(
                     shred1.clone(),
                     Pubkey::new_unique(), // self_pubkey
-                    shred2.payload().clone(),
+                    shred2.payload().to_vec(),
                     Some(leader_schedule),
                     rng.gen(), // wallclock
                     512,       // max_size
@@ -1250,7 +1255,7 @@ pub(crate) mod tests {
                 from_shred(
                     shred1.clone(),
                     Pubkey::new_unique(), // self_pubkey
-                    shred2.payload().clone(),
+                    shred2.payload().to_vec(),
                     Some(leader_schedule),
                     rng.gen(), // wallclock
                     512,       // max_size
@@ -1306,16 +1311,20 @@ pub(crate) mod tests {
             &Signature::new_unique(),
         )
         .unwrap();
-        let data_shred_different_retransmitter =
-            Shred::new_from_serialized_shred(data_shred_different_retransmitter_payload).unwrap();
+        let data_shred_different_retransmitter = Shred::new_from_serialized_shred(Cow::Owned(
+            data_shred_different_retransmitter_payload,
+        ))
+        .unwrap();
         let mut coding_shred_different_retransmitter_payload = coding_shred.clone().into_payload();
         shred::layout::set_retransmitter_signature(
             &mut coding_shred_different_retransmitter_payload,
             &Signature::new_unique(),
         )
         .unwrap();
-        let coding_shred_different_retransmitter =
-            Shred::new_from_serialized_shred(coding_shred_different_retransmitter_payload).unwrap();
+        let coding_shred_different_retransmitter = Shred::new_from_serialized_shred(Cow::Owned(
+            coding_shred_different_retransmitter_payload,
+        ))
+        .unwrap();
 
         let test_cases = vec![
             // Same data shred from different retransmitter
@@ -1328,7 +1337,7 @@ pub(crate) mod tests {
                 from_shred(
                     shred1.clone(),
                     Pubkey::new_unique(), // self_pubkey
-                    shred2.payload().clone(),
+                    shred2.payload().to_vec(),
                     Some(leader_schedule),
                     rng.gen(), // wallclock
                     512,       // max_size

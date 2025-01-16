@@ -15,7 +15,7 @@ use {
     solana_rayon_threadlimit::get_thread_count,
     solana_sdk::{clock::Slot, hash::Hash, signature::Keypair},
     std::{
-        borrow::Borrow,
+        borrow::{Borrow, Cow},
         fmt::Debug,
         sync::{Arc, RwLock},
     },
@@ -82,8 +82,8 @@ impl Shredder {
         reed_solomon_cache: &ReedSolomonCache,
         stats: &mut ProcessShredsStats,
     ) -> (
-        Vec<Shred>, // data shreds
-        Vec<Shred>, // coding shreds
+        Vec<Shred<'static>>, // data shreds
+        Vec<Shred<'static>>, // coding shreds
     ) {
         if merkle_variant {
             return shred::make_merkle_shreds_from_entries(
@@ -125,7 +125,7 @@ impl Shredder {
         is_last_in_slot: bool,
         next_shred_index: u32,
         process_stats: &mut ProcessShredsStats,
-    ) -> Vec<Shred> {
+    ) -> Vec<Shred<'static>> {
         let mut serialize_time = Measure::start("shred_serialize");
         let serialized_shreds =
             bincode::serialize(entries).expect("Expect to serialize all entries");
@@ -187,13 +187,13 @@ impl Shredder {
         shreds
     }
 
-    fn data_shreds_to_coding_shreds(
+    fn data_shreds_to_coding_shreds<'a>(
         keypair: &Keypair,
-        data_shreds: &[Shred],
+        data_shreds: &[Shred<'a>],
         next_code_index: u32,
         reed_solomon_cache: &ReedSolomonCache,
         process_stats: &mut ProcessShredsStats,
-    ) -> Result<Vec<Shred>, Error> {
+    ) -> Result<Vec<Shred<'a>>, Error> {
         if data_shreds.is_empty() {
             return Ok(Vec::default());
         }
@@ -263,11 +263,11 @@ impl Shredder {
     }
 
     /// Generates coding shreds for the data shreds in the current FEC set
-    pub fn generate_coding_shreds<T: Borrow<Shred>>(
+    pub fn generate_coding_shreds<'a, 'b, T: Borrow<Shred<'a>>>(
         data: &[T],
         next_code_index: u32,
         reed_solomon_cache: &ReedSolomonCache,
-    ) -> Vec<Shred> {
+    ) -> Vec<Shred<'b>> {
         let (slot, index, version, fec_set_index) = {
             let shred = data.first().unwrap().borrow();
             (
@@ -327,10 +327,10 @@ impl Shredder {
             .collect()
     }
 
-    pub fn try_recovery(
+    pub fn try_recovery<'a>(
         shreds: Vec<Shred>,
         reed_solomon_cache: &ReedSolomonCache,
-    ) -> Result<Vec<Shred>, Error> {
+    ) -> Result<Vec<Shred<'a>>, Error> {
         let (slot, fec_set_index) = match shreds.first() {
             None => return Err(Error::from(TooFewShardsPresent)),
             Some(shred) => (shred.slot(), shred.fec_set_index()),
@@ -377,7 +377,7 @@ impl Shredder {
             .into_iter()
             .zip(shards)
             .filter(|(mask, _)| !mask)
-            .filter_map(|(_, shard)| Shred::new_from_serialized_shred(shard?).ok())
+            .filter_map(|(_, shard)| Shred::new_from_serialized_shred(Cow::Owned(shard?)).ok())
             .filter(|shred| {
                 shred.slot() == slot
                     && shred.is_data()
@@ -651,7 +651,7 @@ mod tests {
             &mut ProcessShredsStats::default(),
         );
         for shred in [data_shreds, coding_shreds].into_iter().flatten() {
-            let other = Shred::new_from_serialized_shred(shred.payload().clone());
+            let other = Shred::new_from_serialized_shred(Cow::Borrowed(shred.payload()));
             assert_eq!(shred, other.unwrap());
         }
     }
@@ -693,7 +693,7 @@ mod tests {
         });
 
         let deserialized_shred =
-            Shred::new_from_serialized_shred(data_shreds.last().unwrap().payload().clone())
+            Shred::new_from_serialized_shred(Cow::Borrowed(data_shreds.last().unwrap().payload()))
                 .unwrap();
         assert_eq!(deserialized_shred.reference_tick(), 5);
     }
@@ -741,7 +741,7 @@ mod tests {
         });
 
         let deserialized_shred =
-            Shred::new_from_serialized_shred(data_shreds.last().unwrap().payload().clone())
+            Shred::new_from_serialized_shred(Cow::Borrowed(data_shreds.last().unwrap().payload()))
                 .unwrap();
         assert_eq!(
             deserialized_shred.reference_tick(),

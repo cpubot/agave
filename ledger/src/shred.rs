@@ -69,7 +69,7 @@ use {
         signature::{Keypair, Signature, Signer, SIGNATURE_BYTES},
     },
     static_assertions::const_assert_eq,
-    std::{fmt::Debug, time::Instant, vec::Drain},
+    std::{borrow::Cow, fmt::Debug, time::Instant, vec::Drain},
     thiserror::Error,
 };
 pub use {
@@ -234,9 +234,18 @@ struct CodingShredHeader {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Shred {
-    ShredCode(ShredCode),
-    ShredData(ShredData),
+pub enum Shred<'a> {
+    ShredCode(ShredCode<'a>),
+    ShredData(ShredData<'a>),
+}
+
+impl Shred<'_> {
+    pub fn into_owned(self) -> Shred<'static> {
+        match self {
+            Shred::ShredCode(shred) => Shred::ShredCode(shred.into_owned()),
+            Shred::ShredData(shred) => Shred::ShredData(shred.into_owned()),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -346,7 +355,7 @@ macro_rules! dispatch {
 
 use dispatch;
 
-impl Shred {
+impl<'a> Shred<'a> {
     dispatch!(fn common_header(&self) -> &ShredCommonHeader);
     dispatch!(fn set_signature(&mut self, signature: Signature));
     dispatch!(fn signed_data(&self) -> Result<SignedData, Error>);
@@ -362,7 +371,7 @@ impl Shred {
 
     dispatch!(pub fn into_payload(self) -> Vec<u8>);
     dispatch!(pub fn merkle_root(&self) -> Result<Hash, Error>);
-    dispatch!(pub fn payload(&self) -> &Vec<u8>);
+    dispatch!(pub fn payload(&self) -> &[u8]);
     dispatch!(pub fn sanitize(&self) -> Result<(), Error>);
 
     // Only for tests.
@@ -372,7 +381,7 @@ impl Shred {
     pub fn copy_to_packet(&self, packet: &mut Packet) {
         let payload = self.payload();
         let size = payload.len();
-        packet.buffer_mut()[..size].copy_from_slice(&payload[..]);
+        packet.buffer_mut()[..size].copy_from_slice(payload);
         packet.meta_mut().size = size;
     }
 
@@ -386,8 +395,8 @@ impl Shred {
         reference_tick: u8,
         version: u16,
         fec_set_index: u32,
-    ) -> Self {
-        Self::from(ShredData::new_from_data(
+    ) -> Shred<'static> {
+        Shred::from(ShredData::new_from_data(
             slot,
             index,
             parent_offset,
@@ -399,7 +408,7 @@ impl Shred {
         ))
     }
 
-    pub fn new_from_serialized_shred(shred: Vec<u8>) -> Result<Self, Error> {
+    pub fn new_from_serialized_shred(shred: Cow<'a, [u8]>) -> Result<Self, Error> {
         Ok(match layout::get_shred_variant(&shred)? {
             ShredVariant::LegacyCode => {
                 let shred = legacy::ShredCode::from_payload(shred)?;
@@ -586,11 +595,11 @@ impl Shred {
     /// Returns true if the other shred has the same ShredId, i.e. (slot, index,
     /// shred-type), but different payload.
     /// Retransmitter's signature is ignored when comparing payloads.
-    pub fn is_shred_duplicate(&self, other: &Shred) -> bool {
+    pub fn is_shred_duplicate(&self, other: &Shred<'_>) -> bool {
         if self.id() != other.id() {
             return false;
         }
-        fn get_payload(shred: &Shred) -> &[u8] {
+        fn get_payload<'b>(shred: &'b Shred<'b>) -> &'b [u8] {
             let Ok(offset) = shred.retransmitter_signature_offset() else {
                 return shred.payload();
             };
@@ -965,20 +974,20 @@ pub mod layout {
     }
 }
 
-impl From<ShredCode> for Shred {
-    fn from(shred: ShredCode) -> Self {
+impl<'a> From<ShredCode<'a>> for Shred<'a> {
+    fn from(shred: ShredCode<'a>) -> Self {
         Self::ShredCode(shred)
     }
 }
 
-impl From<ShredData> for Shred {
-    fn from(shred: ShredData) -> Self {
+impl<'a> From<ShredData<'a>> for Shred<'a> {
+    fn from(shred: ShredData<'a>) -> Self {
         Self::ShredData(shred)
     }
 }
 
-impl From<merkle::Shred> for Shred {
-    fn from(shred: merkle::Shred) -> Self {
+impl<'a> From<merkle::Shred<'a>> for Shred<'a> {
+    fn from(shred: merkle::Shred<'a>) -> Self {
         match shred {
             merkle::Shred::ShredCode(shred) => Self::ShredCode(ShredCode::Merkle(shred)),
             merkle::Shred::ShredData(shred) => Self::ShredData(ShredData::Merkle(shred)),
@@ -986,10 +995,10 @@ impl From<merkle::Shred> for Shred {
     }
 }
 
-impl TryFrom<Shred> for merkle::Shred {
+impl<'a> TryFrom<Shred<'a>> for merkle::Shred<'a> {
     type Error = Error;
 
-    fn try_from(shred: Shred) -> Result<Self, Self::Error> {
+    fn try_from(shred: Shred<'a>) -> Result<Self, Self::Error> {
         match shred {
             Shred::ShredCode(ShredCode::Legacy(_)) => Err(Error::InvalidShredVariant),
             Shred::ShredCode(ShredCode::Merkle(shred)) => Ok(Self::ShredCode(shred)),
@@ -1106,11 +1115,11 @@ impl TryFrom<u8> for ShredVariant {
     }
 }
 
-pub(crate) fn recover(
-    shreds: Vec<Shred>,
+pub(crate) fn recover<'a>(
+    shreds: Vec<Shred<'a>>,
     reed_solomon_cache: &ReedSolomonCache,
     get_slot_leader: impl Fn(Slot) -> Option<Pubkey>,
-) -> Result<Vec<Shred>, Error> {
+) -> Result<Vec<Shred<'a>>, Error> {
     match shreds
         .first()
         .ok_or(TooFewShardsPresent)?
@@ -1168,7 +1177,7 @@ pub(crate) fn make_merkle_shreds_from_entries(
     next_code_index: u32,
     reed_solomon_cache: &ReedSolomonCache,
     stats: &mut ProcessShredsStats,
-) -> Result<Vec<Shred>, Error> {
+) -> Result<Vec<Shred<'static>>, Error> {
     let now = Instant::now();
     let entries = bincode::serialize(entries)?;
     stats.serialize_elapsed += now.elapsed().as_micros() as u64;
@@ -1303,7 +1312,7 @@ pub fn should_discard_shred(
 // Note that the function does not preserve the order of either the retained or
 // the drained shreds.
 // TODO: Use Vec::extract_if instead once stable.
-pub(crate) fn drain_coding_shreds(shreds: &mut Vec<Shred>) -> Drain<'_, Shred> {
+pub(crate) fn drain_coding_shreds<'a, 'b>(shreds: &'b mut Vec<Shred<'a>>) -> Drain<'b, Shred<'a>> {
     let (mut i, mut j) = (0, shreds.len().saturating_sub(1));
     loop {
         while i < j && shreds[i].is_data() {
@@ -1392,13 +1401,13 @@ mod tests {
         bs58::decode(data).into_vec().unwrap()
     }
 
-    fn make_merkle_shreds_for_tests<R: Rng>(
+    fn make_merkle_shreds_for_tests<'a, R: Rng>(
         rng: &mut R,
         slot: Slot,
         data_size: usize,
         chained: bool,
         is_last_in_slot: bool,
-    ) -> Result<Vec<Vec<merkle::Shred>>, Error> {
+    ) -> Result<Vec<Vec<merkle::Shred<'a>>>, Error> {
         let thread_pool = ThreadPoolBuilder::new().num_threads(2).build().unwrap();
         let chained_merkle_root = chained.then(|| Hash::new_from_array(rng.gen()));
         let parent_offset = rng.gen_range(1..=u16::try_from(slot).unwrap_or(u16::MAX));
@@ -1513,7 +1522,7 @@ mod tests {
         let shred = Shred::new_from_data(10, 0, 1000, &[1, 2, 3], ShredFlags::empty(), 0, 1, 0);
         let mut packet = Packet::default();
         shred.copy_to_packet(&mut packet);
-        let shred_res = Shred::new_from_serialized_shred(packet.data(..).unwrap().to_vec());
+        let shred_res = Shred::new_from_serialized_shred(Cow::Borrowed(packet.data(..).unwrap()));
         assert_matches!(
             shred.parent(),
             Err(Error::InvalidParentOffset {
@@ -2037,7 +2046,10 @@ mod tests {
         packet.buffer_mut()[..payload.len()].copy_from_slice(&payload);
         packet.meta_mut().size = payload.len();
         assert_eq!(shred.bytes_to_store(), payload);
-        assert_eq!(shred, Shred::new_from_serialized_shred(payload).unwrap());
+        assert_eq!(
+            shred,
+            Shred::new_from_serialized_shred(Cow::Owned(payload)).unwrap()
+        );
         verify_shred_layout(&shred, &packet);
     }
 
@@ -2072,7 +2084,10 @@ mod tests {
         packet.buffer_mut()[..payload.len()].copy_from_slice(&payload);
         packet.meta_mut().size = payload.len();
         assert_eq!(shred.bytes_to_store(), payload);
-        assert_eq!(shred, Shred::new_from_serialized_shred(payload).unwrap());
+        assert_eq!(
+            shred,
+            Shred::new_from_serialized_shred(Cow::Owned(payload)).unwrap()
+        );
         verify_shred_layout(&shred, &packet);
     }
 
@@ -2114,13 +2129,20 @@ mod tests {
         packet.buffer_mut()[..payload.len()].copy_from_slice(&payload);
         packet.meta_mut().size = payload.len();
         assert_eq!(shred.bytes_to_store(), payload);
-        assert_eq!(shred, Shred::new_from_serialized_shred(payload).unwrap());
+        assert_eq!(
+            shred,
+            Shred::new_from_serialized_shred(Cow::Owned(payload)).unwrap()
+        );
         verify_shred_layout(&shred, &packet);
     }
 
     #[test]
     fn test_shred_flags() {
-        fn make_shred(is_last_data: bool, is_last_in_slot: bool, reference_tick: u8) -> Shred {
+        fn make_shred<'a>(
+            is_last_data: bool,
+            is_last_in_slot: bool,
+            reference_tick: u8,
+        ) -> Shred<'a> {
             let flags = if is_last_in_slot {
                 assert!(is_last_data);
                 ShredFlags::LAST_SHRED_IN_SLOT
@@ -2201,12 +2223,12 @@ mod tests {
     #[test_case(true, false)]
     #[test_case(true, true)]
     fn test_is_shred_duplicate(chained: bool, is_last_in_slot: bool) {
-        fn fill_retransmitter_signature<R: Rng>(
+        fn fill_retransmitter_signature<'a, R: Rng>(
             rng: &mut R,
-            shred: Shred,
+            shred: Shred<'a>,
             chained: bool,
             is_last_in_slot: bool,
-        ) -> Shred {
+        ) -> Shred<'a> {
             let mut shred = shred.into_payload();
             let mut signature = [0u8; SIGNATURE_BYTES];
             rng.fill(&mut signature[..]);
@@ -2216,7 +2238,7 @@ mod tests {
             } else {
                 assert_matches!(out, Err(Error::InvalidShredVariant));
             }
-            Shred::new_from_serialized_shred(shred).unwrap()
+            Shred::new_from_serialized_shred(Cow::Owned(shred)).unwrap()
         }
         let mut rng = rand::thread_rng();
         let slot = 285_376_049 + rng.gen_range(0..100_000);
@@ -2259,9 +2281,9 @@ mod tests {
         // Shreds of the same (slot, index, shred-type) with different payload
         // (ignoring retransmitter signature) are duplicate.
         for shred in &shreds {
-            let mut other = shred.payload().clone();
+            let mut other = shred.payload().to_vec();
             other[90] = other[90].wrapping_add(1);
-            let other = Shred::new_from_serialized_shred(other).unwrap();
+            let other = Shred::new_from_serialized_shred(Cow::Owned(other)).unwrap();
             assert_ne!(shred.payload(), other.payload());
             assert_eq!(
                 layout::get_retransmitter_signature(shred.payload()).ok(),

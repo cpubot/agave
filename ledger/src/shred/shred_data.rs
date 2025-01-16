@@ -11,12 +11,22 @@ use {
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ShredData {
-    Legacy(legacy::ShredData),
-    Merkle(merkle::ShredData),
+pub enum ShredData<'a> {
+    Legacy(legacy::ShredData<'a>),
+    Merkle(merkle::ShredData<'a>),
 }
 
-impl ShredData {
+impl ShredData<'_> {
+    #[inline(always)]
+    pub fn into_owned(self) -> ShredData<'static> {
+        match self {
+            ShredData::Legacy(shred) => ShredData::Legacy(shred.into_owned()),
+            ShredData::Merkle(shred) => ShredData::Merkle(shred.into_owned()),
+        }
+    }
+}
+
+impl ShredData<'_> {
     dispatch!(fn data_header(&self) -> &DataShredHeader);
 
     dispatch!(pub(super) fn common_header(&self) -> &ShredCommonHeader);
@@ -26,7 +36,7 @@ impl ShredData {
     dispatch!(pub(super) fn erasure_shard_index(&self) -> Result<usize, Error>);
     dispatch!(pub(super) fn into_payload(self) -> Vec<u8>);
     dispatch!(pub(super) fn parent(&self) -> Result<Slot, Error>);
-    dispatch!(pub(super) fn payload(&self) -> &Vec<u8>);
+    dispatch!(pub(super) fn payload(&self) -> &[u8]);
     dispatch!(pub(super) fn sanitize(&self) -> Result<(), Error>);
     dispatch!(pub(super) fn set_signature(&mut self, signature: Signature));
 
@@ -64,8 +74,8 @@ impl ShredData {
         reference_tick: u8,
         version: u16,
         fec_set_index: u32,
-    ) -> Self {
-        Self::from(legacy::ShredData::new_from_data(
+    ) -> ShredData<'static> {
+        ShredData::from(legacy::ShredData::new_from_data(
             slot,
             index,
             parent_offset,
@@ -152,26 +162,26 @@ impl ShredData {
     }
 }
 
-impl From<legacy::ShredData> for ShredData {
-    fn from(shred: legacy::ShredData) -> Self {
+impl<'a> From<legacy::ShredData<'a>> for ShredData<'a> {
+    fn from(shred: legacy::ShredData<'a>) -> Self {
         Self::Legacy(shred)
     }
 }
 
-impl From<merkle::ShredData> for ShredData {
-    fn from(shred: merkle::ShredData) -> Self {
+impl<'a> From<merkle::ShredData<'a>> for ShredData<'a> {
+    fn from(shred: merkle::ShredData<'a>) -> Self {
         Self::Merkle(shred)
     }
 }
 
 #[inline]
-pub(super) fn erasure_shard_index<T: ShredDataTrait>(shred: &T) -> Option<usize> {
+pub(super) fn erasure_shard_index<'a, T: ShredDataTrait<'a>>(shred: &T) -> Option<usize> {
     let fec_set_index = shred.common_header().fec_set_index;
     let index = shred.common_header().index.checked_sub(fec_set_index)?;
     usize::try_from(index).ok()
 }
 
-pub(super) fn sanitize<T: ShredDataTrait>(shred: &T) -> Result<(), Error> {
+pub(super) fn sanitize<'a, T: ShredDataTrait<'a>>(shred: &'a T) -> Result<(), Error> {
     if shred.payload().len() != T::SIZE_OF_PAYLOAD {
         return Err(Error::InvalidPayloadSize(shred.payload().len()));
     }

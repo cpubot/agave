@@ -86,6 +86,7 @@ use {
     solana_vote::vote_parser,
     solana_vote_program::{vote_state::MAX_LOCKOUT_HISTORY, vote_transaction},
     std::{
+        borrow::Cow,
         collections::{BTreeSet, HashMap, HashSet},
         fs,
         io::Read,
@@ -5676,8 +5677,8 @@ fn test_duplicate_shreds_switch_failure() {
     let duplicate_leader_ledger_path = cluster.ledger_path(&duplicate_leader_validator_pubkey);
     cluster.exit_node(&duplicate_leader_validator_pubkey);
 
-    let dup_shred1 = Shred::new_from_serialized_shred(duplicate_proof.shred1.clone()).unwrap();
-    let dup_shred2 = Shred::new_from_serialized_shred(duplicate_proof.shred2).unwrap();
+    let dup_shred1 = Shred::new_from_serialized_shred(Cow::Owned(duplicate_proof.shred1)).unwrap();
+    let dup_shred2 = Shred::new_from_serialized_shred(Cow::Owned(duplicate_proof.shred2)).unwrap();
     assert_eq!(dup_shred1.slot(), dup_shred2.slot());
     assert_eq!(dup_shred1.slot(), dup_slot);
 

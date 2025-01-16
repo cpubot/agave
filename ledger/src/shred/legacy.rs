@@ -10,7 +10,7 @@ use {
     solana_perf::packet::deserialize_from_with_limit,
     solana_sdk::{clock::Slot, signature::Signature},
     static_assertions::const_assert_eq,
-    std::{io::Cursor, ops::Range},
+    std::{borrow::Cow, io::Cursor, ops::Range},
 };
 
 // All payload including any zero paddings are signed.
@@ -33,22 +33,43 @@ pub(super) const SIZE_OF_ERASURE_ENCODED_SLICE: usize =
 // All payload past signature, including the entirety of zero paddings, is
 // signed.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ShredData {
+pub struct ShredData<'a> {
     common_header: ShredCommonHeader,
     data_header: DataShredHeader,
-    payload: Vec<u8>,
+    payload: Cow<'a, [u8]>,
 }
-
 // Layout: {common, coding} headers | erasure coded shard
 // All payload past signature is singed.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ShredCode {
+pub struct ShredCode<'a> {
     common_header: ShredCommonHeader,
     coding_header: CodingShredHeader,
-    payload: Vec<u8>,
+    payload: Cow<'a, [u8]>,
 }
 
-impl<'a> Shred<'a> for ShredData {
+impl ShredData<'_> {
+    #[inline(always)]
+    pub fn into_owned(self) -> ShredData<'static> {
+        ShredData {
+            common_header: self.common_header,
+            data_header: self.data_header,
+            payload: Cow::Owned(self.payload.into_owned()),
+        }
+    }
+}
+
+impl ShredCode<'_> {
+    #[inline(always)]
+    pub fn into_owned(self) -> ShredCode<'static> {
+        ShredCode {
+            common_header: self.common_header,
+            coding_header: self.coding_header,
+            payload: Cow::Owned(self.payload.into_owned()),
+        }
+    }
+}
+
+impl<'a> Shred<'a> for ShredData<'a> {
     type SignedData = &'a [u8];
 
     impl_shred_common!();
@@ -57,7 +78,7 @@ impl<'a> Shred<'a> for ShredData {
     const SIZE_OF_PAYLOAD: usize = shred_code::ShredCode::SIZE_OF_PAYLOAD;
     const SIZE_OF_HEADERS: usize = SIZE_OF_DATA_SHRED_HEADERS;
 
-    fn from_payload(mut payload: Vec<u8>) -> Result<Self, Error> {
+    fn from_payload(payload: Cow<'a, [u8]>) -> Result<Self, Error> {
         let mut cursor = Cursor::new(&payload[..]);
         let common_header: ShredCommonHeader = deserialize_from_with_limit(&mut cursor)?;
         if common_header.shred_variant != ShredVariant::LegacyData {
@@ -71,11 +92,12 @@ impl<'a> Shred<'a> for ShredData {
         if payload.len() < Self::SIZE_OF_HEADERS {
             return Err(Error::InvalidPayloadSize(payload.len()));
         }
+        let mut payload = payload.into_owned();
         payload.resize(Self::SIZE_OF_PAYLOAD, 0u8);
         let shred = Self {
             common_header,
             data_header,
-            payload,
+            payload: Cow::Owned(payload),
         };
         shred.sanitize().map(|_| shred)
     }
@@ -91,7 +113,7 @@ impl<'a> Shred<'a> for ShredData {
         if self.payload.len() != Self::SIZE_OF_PAYLOAD {
             return Err(Error::InvalidPayloadSize(self.payload.len()));
         }
-        let mut shard = self.payload;
+        let mut shard = self.payload.into_owned();
         shard.truncate(SIZE_OF_ERASURE_ENCODED_SLICE);
         Ok(shard)
     }
@@ -117,14 +139,14 @@ impl<'a> Shred<'a> for ShredData {
     }
 }
 
-impl<'a> Shred<'a> for ShredCode {
+impl<'a> Shred<'a> for ShredCode<'a> {
     type SignedData = &'a [u8];
 
     impl_shred_common!();
     const SIZE_OF_PAYLOAD: usize = shred_code::ShredCode::SIZE_OF_PAYLOAD;
     const SIZE_OF_HEADERS: usize = SIZE_OF_CODING_SHRED_HEADERS;
 
-    fn from_payload(mut payload: Vec<u8>) -> Result<Self, Error> {
+    fn from_payload(payload: Cow<'a, [u8]>) -> Result<Self, Error> {
         let mut cursor = Cursor::new(&payload[..]);
         let common_header: ShredCommonHeader = deserialize_from_with_limit(&mut cursor)?;
         if common_header.shred_variant != ShredVariant::LegacyCode {
@@ -133,7 +155,7 @@ impl<'a> Shred<'a> for ShredCode {
         let coding_header = deserialize_from_with_limit(&mut cursor)?;
         // Repair packets have nonce at the end of packet payload:
         // https://github.com/solana-labs/solana/pull/10109
-        payload.truncate(Self::SIZE_OF_PAYLOAD);
+        let payload = Self::extract_payload(payload);
         let shred = Self {
             common_header,
             coding_header,
@@ -153,7 +175,7 @@ impl<'a> Shred<'a> for ShredCode {
         if self.payload.len() != Self::SIZE_OF_PAYLOAD {
             return Err(Error::InvalidPayloadSize(self.payload.len()));
         }
-        let mut shard = self.payload;
+        let mut shard = self.payload.into_owned();
         // ShredCode::SIZE_OF_HEADERS bytes at the beginning of the coding
         // shreds contains the header and is not part of erasure coding.
         shard.drain(..Self::SIZE_OF_HEADERS);
@@ -181,7 +203,7 @@ impl<'a> Shred<'a> for ShredCode {
     }
 }
 
-impl ShredDataTrait for ShredData {
+impl<'a> ShredDataTrait<'a> for ShredData<'a> {
     #[inline]
     fn data_header(&self) -> &DataShredHeader {
         &self.data_header
@@ -203,14 +225,14 @@ impl ShredDataTrait for ShredData {
     }
 }
 
-impl ShredCodeTrait for ShredCode {
+impl<'a> ShredCodeTrait<'a> for ShredCode<'a> {
     #[inline]
     fn coding_header(&self) -> &CodingShredHeader {
         &self.coding_header
     }
 }
 
-impl ShredData {
+impl ShredData<'_> {
     // Maximum size of ledger data that can be embedded in a data-shred.
     pub(super) const CAPACITY: usize =
         Self::SIZE_OF_PAYLOAD - Self::SIZE_OF_HEADERS - ShredCode::SIZE_OF_HEADERS;
@@ -224,7 +246,7 @@ impl ShredData {
         reference_tick: u8,
         version: u16,
         fec_set_index: u32,
-    ) -> Self {
+    ) -> ShredData<'static> {
         let mut payload = vec![0; Self::SIZE_OF_PAYLOAD];
         let common_header = ShredCommonHeader {
             signature: Signature::default(),
@@ -253,10 +275,10 @@ impl ShredData {
         let offset = cursor.position() as usize;
         debug_assert_eq!(offset, Self::SIZE_OF_HEADERS);
         payload[offset..offset + data.len()].copy_from_slice(data);
-        Self {
+        ShredData {
             common_header,
             data_header,
-            payload,
+            payload: Cow::Owned(payload),
         }
     }
 
@@ -278,12 +300,12 @@ impl ShredData {
     // Only for tests.
     pub(crate) fn set_last_in_slot(&mut self) {
         self.data_header.flags |= ShredFlags::LAST_SHRED_IN_SLOT;
-        let buffer = &mut self.payload[SIZE_OF_COMMON_SHRED_HEADER..];
+        let buffer = &mut self.payload.to_mut()[SIZE_OF_COMMON_SHRED_HEADER..];
         bincode::serialize_into(buffer, &self.data_header).unwrap();
     }
 }
 
-impl ShredCode {
+impl ShredCode<'_> {
     pub(super) fn new_from_parity_shard(
         slot: Slot,
         index: u32,
@@ -320,7 +342,7 @@ impl ShredCode {
         Self {
             common_header,
             coding_header,
-            payload,
+            payload: Cow::Owned(payload),
         }
     }
 }
@@ -350,7 +372,7 @@ mod test {
         // Corrupt shred by making it too large
         {
             let mut shred = shred.clone();
-            shred.payload.push(10u8);
+            shred.payload.to_mut().push(10u8);
             assert_matches!(shred.sanitize(), Err(Error::InvalidPayloadSize(1229)));
         }
         {

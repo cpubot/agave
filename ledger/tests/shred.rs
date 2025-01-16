@@ -19,7 +19,7 @@ use {
     test_case::test_case,
 };
 
-type IndexShredsMap = BTreeMap<u32, Vec<Shred>>;
+type IndexShredsMap<'a> = BTreeMap<u32, Vec<Shred<'a>>>;
 
 #[test_case(false)]
 #[test_case(true)]
@@ -153,11 +153,11 @@ fn test_multi_fec_block_different_size_coding() {
     }
 }
 
-fn sort_data_coding_into_fec_sets(
-    data_shreds: Vec<Shred>,
-    coding_shreds: Vec<Shred>,
-    fec_data: &mut IndexShredsMap,
-    fec_coding: &mut IndexShredsMap,
+fn sort_data_coding_into_fec_sets<'a>(
+    data_shreds: Vec<Shred<'a>>,
+    coding_shreds: Vec<Shred<'a>>,
+    fec_data: &mut IndexShredsMap<'a>,
+    fec_coding: &mut IndexShredsMap<'a>,
     data_slot_and_index: &mut HashSet<(Slot, u32)>,
     coding_slot_and_index: &mut HashSet<(Slot, u32)>,
 ) {
@@ -182,11 +182,11 @@ fn sort_data_coding_into_fec_sets(
 }
 
 #[allow(clippy::assertions_on_constants)]
-fn setup_different_sized_fec_blocks(
+fn setup_different_sized_fec_blocks<'a>(
     slot: Slot,
     parent_slot: Slot,
     keypair: Arc<Keypair>,
-) -> (IndexShredsMap, IndexShredsMap, usize) {
+) -> (IndexShredsMap<'a>, IndexShredsMap<'a>, usize) {
     let shredder = Shredder::new(slot, parent_slot, 0, 0).unwrap();
     let keypair0 = Keypair::new();
     let keypair1 = Keypair::new();

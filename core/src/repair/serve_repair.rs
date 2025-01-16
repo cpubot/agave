@@ -112,8 +112,8 @@ impl ShredRepairType {
     }
 }
 
-impl RequestResponse for ShredRepairType {
-    type Response = Shred;
+impl<'a> RequestResponse<'a> for ShredRepairType {
+    type Response = Shred<'a>;
     fn num_expected_responses(&self) -> u32 {
         match self {
             ShredRepairType::Orphan(_) => MAX_ORPHAN_REPAIR_RESPONSES as u32,
@@ -147,7 +147,7 @@ pub enum AncestorHashesResponse {
     Ping(Ping),
 }
 
-impl RequestResponse for AncestorHashesRepairType {
+impl RequestResponse<'_> for AncestorHashesRepairType {
     type Response = AncestorHashesResponse;
     fn num_expected_responses(&self) -> u32 {
         1
@@ -1454,7 +1454,7 @@ mod tests {
         solana_runtime::bank::Bank,
         solana_sdk::{hash::Hash, pubkey::Pubkey, signature::Keypair, timing::timestamp},
         solana_streamer::socket::SocketAddrSpace,
-        std::{io::Cursor, net::Ipv4Addr},
+        std::{borrow::Cow, io::Cursor, net::Ipv4Addr},
     };
 
     #[test]
@@ -1913,7 +1913,7 @@ mod tests {
             .into_iter()
             .filter_map(|p| {
                 assert_eq!(repair_response::nonce(p).unwrap(), nonce);
-                Shred::new_from_serialized_shred(p.data(..).unwrap().to_vec()).ok()
+                Shred::new_from_serialized_shred(Cow::Borrowed(p.data(..).unwrap())).ok()
             })
             .collect();
         assert!(!rv.is_empty());
@@ -1974,7 +1974,7 @@ mod tests {
             .into_iter()
             .filter_map(|p| {
                 assert_eq!(repair_response::nonce(p).unwrap(), nonce);
-                Shred::new_from_serialized_shred(p.data(..).unwrap().to_vec()).ok()
+                Shred::new_from_serialized_shred(Cow::Borrowed(p.data(..).unwrap())).ok()
             })
             .collect();
         assert_eq!(rv[0].index(), 1);
@@ -2405,7 +2405,7 @@ mod tests {
 
     #[test]
     fn test_verify_shred_response() {
-        fn new_test_data_shred(slot: Slot, index: u32) -> Shred {
+        fn new_test_data_shred(slot: Slot, index: u32) -> Shred<'static> {
             Shred::new_from_data(slot, index, 1, &[], ShredFlags::empty(), 0, 0, 0)
         }
         let repair = ShredRepairType::Orphan(9);
@@ -2453,8 +2453,8 @@ mod tests {
 
     fn verify_responses<'a>(request: &ShredRepairType, packets: impl Iterator<Item = &'a Packet>) {
         for packet in packets {
-            let shred_payload = packet.data(..).unwrap().to_vec();
-            let shred = Shred::new_from_serialized_shred(shred_payload).unwrap();
+            let shred_payload = packet.data(..).unwrap();
+            let shred = Shred::new_from_serialized_shred(Cow::Borrowed(shred_payload)).unwrap();
             request.verify_response(&shred);
         }
     }

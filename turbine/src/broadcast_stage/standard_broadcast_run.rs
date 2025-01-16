@@ -78,7 +78,7 @@ impl StandardBroadcastRun {
         max_ticks_in_slot: u8,
         cluster_type: ClusterType,
         stats: &mut ProcessShredsStats,
-    ) -> Vec<Shred> {
+    ) -> Vec<Shred<'static>> {
         const SHRED_TICK_REFERENCE_MASK: u8 = ShredFlags::SHRED_TICK_REFERENCE_MASK.bits();
         if self.completed {
             return vec![];
@@ -123,8 +123,8 @@ impl StandardBroadcastRun {
         max_code_shreds_per_slot: u32,
     ) -> std::result::Result<
         (
-            Vec<Shred>, // data shreds
-            Vec<Shred>, // coding shreds
+            Vec<Shred<'static>>, // data shreds
+            Vec<Shred<'static>>, // coding shreds
         ),
         BroadcastError,
     > {
@@ -188,8 +188,8 @@ impl StandardBroadcastRun {
         &mut self,
         keypair: &Keypair,
         blockstore: &Blockstore,
-        socket_sender: &Sender<(Arc<Vec<Shred>>, Option<BroadcastShredBatchInfo>)>,
-        blockstore_sender: &Sender<(Arc<Vec<Shred>>, Option<BroadcastShredBatchInfo>)>,
+        socket_sender: &Sender<(Arc<Vec<Shred<'static>>>, Option<BroadcastShredBatchInfo>)>,
+        blockstore_sender: &Sender<(Arc<Vec<Shred<'static>>>, Option<BroadcastShredBatchInfo>)>,
         receive_results: ReceiveResults,
     ) -> Result<()> {
         let mut receive_elapsed = receive_results.time_elapsed;
@@ -398,7 +398,7 @@ impl StandardBroadcastRun {
         &mut self,
         sock: &UdpSocket,
         cluster_info: &ClusterInfo,
-        shreds: Arc<Vec<Shred>>,
+        shreds: Arc<Vec<Shred<'static>>>,
         broadcast_shred_batch_info: Option<BroadcastShredBatchInfo>,
         bank_forks: &RwLock<BankForks>,
         quic_endpoint_sender: &AsyncSender<(SocketAddr, Bytes)>,
@@ -410,7 +410,7 @@ impl StandardBroadcastRun {
 
         broadcast_shreds(
             sock,
-            &shreds,
+            shreds.as_slice(),
             &self.cluster_nodes_cache,
             &self.last_datapoint_submit,
             &mut transmit_stats,
@@ -464,8 +464,8 @@ impl BroadcastRun for StandardBroadcastRun {
         keypair: &Keypair,
         blockstore: &Blockstore,
         receiver: &Receiver<WorkingBankEntry>,
-        socket_sender: &Sender<(Arc<Vec<Shred>>, Option<BroadcastShredBatchInfo>)>,
-        blockstore_sender: &Sender<(Arc<Vec<Shred>>, Option<BroadcastShredBatchInfo>)>,
+        socket_sender: &Sender<(Arc<Vec<Shred<'static>>>, Option<BroadcastShredBatchInfo>)>,
+        blockstore_sender: &Sender<(Arc<Vec<Shred<'static>>>, Option<BroadcastShredBatchInfo>)>,
     ) -> Result<()> {
         let receive_results = broadcast_utils::recv_slot_entries(receiver)?;
         // TODO: Confirm that last chunk of coding shreds

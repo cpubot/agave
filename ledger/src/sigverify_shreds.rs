@@ -777,12 +777,12 @@ mod tests {
             .collect()
     }
 
-    fn make_shreds<R: Rng>(
+    fn make_shreds<'a, R: Rng>(
         rng: &mut R,
         chained: bool,
         is_last_in_slot: bool,
         keypairs: &HashMap<Slot, Keypair>,
-    ) -> Vec<Shred> {
+    ) -> Vec<Shred<'a>> {
         let reed_solomon_cache = ReedSolomonCache::default();
         let mut shreds: Vec<_> = keypairs
             .iter()

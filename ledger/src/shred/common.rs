@@ -36,18 +36,18 @@ macro_rules! impl_shred_common {
         }
 
         #[inline]
-        fn payload(&self) -> &Vec<u8> {
+        fn payload(&self) -> &[u8] {
             &self.payload
         }
 
         #[inline]
         fn into_payload(self) -> Vec<u8> {
-            self.payload
+            self.payload.into_owned()
         }
 
         #[inline]
         fn set_signature(&mut self, signature: Signature) {
-            self.payload[..SIZE_OF_SIGNATURE].copy_from_slice(signature.as_ref());
+            self.payload.to_mut()[..SIZE_OF_SIGNATURE].copy_from_slice(signature.as_ref());
             self.common_header.signature = signature;
         }
 
@@ -56,7 +56,8 @@ macro_rules! impl_shred_common {
             match self.common_header.shred_variant {
                 ShredVariant::LegacyCode | ShredVariant::LegacyData => {
                     self.common_header.index = index;
-                    bincode::serialize_into(&mut self.payload[..], &self.common_header).unwrap();
+                    bincode::serialize_into(&mut self.payload.to_mut()[..], &self.common_header)
+                        .unwrap();
                 }
                 ShredVariant::MerkleCode { .. } | ShredVariant::MerkleData { .. } => {
                     panic!("Not Implemented!");
@@ -69,7 +70,8 @@ macro_rules! impl_shred_common {
             match self.common_header.shred_variant {
                 ShredVariant::LegacyCode | ShredVariant::LegacyData => {
                     self.common_header.slot = slot;
-                    bincode::serialize_into(&mut self.payload[..], &self.common_header).unwrap();
+                    bincode::serialize_into(&mut self.payload.to_mut()[..], &self.common_header)
+                        .unwrap();
                 }
                 ShredVariant::MerkleCode { .. } | ShredVariant::MerkleData { .. } => {
                     panic!("Not Implemented!");

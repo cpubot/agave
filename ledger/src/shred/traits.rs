@@ -1,6 +1,7 @@
 use {
     crate::shred::{CodingShredHeader, DataShredHeader, Error, ShredCommonHeader},
     solana_sdk::{clock::Slot, signature::Signature},
+    std::borrow::Cow,
 };
 
 pub(super) trait Shred<'a>: Sized {
@@ -12,13 +13,13 @@ pub(super) trait Shred<'a>: Sized {
 
     type SignedData: AsRef<[u8]>;
 
-    fn from_payload(shred: Vec<u8>) -> Result<Self, Error>;
+    fn from_payload(shred: Cow<'a, [u8]>) -> Result<Self, Error>;
     fn common_header(&self) -> &ShredCommonHeader;
     fn sanitize(&self) -> Result<(), Error>;
 
     fn set_signature(&mut self, signature: Signature);
 
-    fn payload(&self) -> &Vec<u8>;
+    fn payload(&self) -> &[u8];
     fn into_payload(self) -> Vec<u8>;
 
     // Returns the shard index within the erasure coding set.
@@ -34,9 +35,20 @@ pub(super) trait Shred<'a>: Sized {
     // Only for tests.
     fn set_index(&mut self, index: u32);
     fn set_slot(&mut self, slot: Slot);
+
+    /// see: https://github.com/solana-labs/solana/pull/10109
+    fn extract_payload(payload: Cow<'a, [u8]>) -> Cow<'a, [u8]> {
+        match payload {
+            Cow::Borrowed(slice) => Cow::Borrowed(&slice[..Self::SIZE_OF_PAYLOAD]),
+            Cow::Owned(mut vec) => {
+                vec.truncate(Self::SIZE_OF_PAYLOAD);
+                Cow::Owned(vec)
+            }
+        }
+    }
 }
 
-pub(super) trait ShredData: for<'a> Shred<'a> {
+pub(super) trait ShredData<'a>: Shred<'a> {
     fn data_header(&self) -> &DataShredHeader;
 
     fn parent(&self) -> Result<Slot, Error> {
@@ -58,7 +70,7 @@ pub(super) trait ShredData: for<'a> Shred<'a> {
     fn data(&self) -> Result<&[u8], Error>;
 }
 
-pub(super) trait ShredCode: for<'a> Shred<'a> {
+pub(super) trait ShredCode<'a>: Shred<'a> {
     fn coding_header(&self) -> &CodingShredHeader;
 
     fn first_coding_index(&self) -> Option<u32> {

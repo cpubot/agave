@@ -57,8 +57,10 @@ const_assert_eq!(CLUSTER_NODES_CACHE_NUM_EPOCH_CAP, 5);
 const CLUSTER_NODES_CACHE_NUM_EPOCH_CAP: usize = MAX_LEADER_SCHEDULE_STAKES as usize;
 const CLUSTER_NODES_CACHE_TTL: Duration = Duration::from_secs(5);
 
-pub(crate) type RecordReceiver = Receiver<(Arc<Vec<Shred>>, Option<BroadcastShredBatchInfo>)>;
-pub(crate) type TransmitReceiver = Receiver<(Arc<Vec<Shred>>, Option<BroadcastShredBatchInfo>)>;
+pub(crate) type RecordReceiver =
+    Receiver<(Arc<Vec<Shred<'static>>>, Option<BroadcastShredBatchInfo>)>;
+pub(crate) type TransmitReceiver =
+    Receiver<(Arc<Vec<Shred<'static>>>, Option<BroadcastShredBatchInfo>)>;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -177,8 +179,8 @@ trait BroadcastRun {
         keypair: &Keypair,
         blockstore: &Blockstore,
         receiver: &Receiver<WorkingBankEntry>,
-        socket_sender: &Sender<(Arc<Vec<Shred>>, Option<BroadcastShredBatchInfo>)>,
-        blockstore_sender: &Sender<(Arc<Vec<Shred>>, Option<BroadcastShredBatchInfo>)>,
+        socket_sender: &Sender<(Arc<Vec<Shred<'static>>>, Option<BroadcastShredBatchInfo>)>,
+        blockstore_sender: &Sender<(Arc<Vec<Shred<'static>>>, Option<BroadcastShredBatchInfo>)>,
     ) -> Result<()>;
     fn transmit(
         &mut self,
@@ -219,8 +221,8 @@ impl BroadcastStage {
         cluster_info: Arc<ClusterInfo>,
         blockstore: &Blockstore,
         receiver: &Receiver<WorkingBankEntry>,
-        socket_sender: &Sender<(Arc<Vec<Shred>>, Option<BroadcastShredBatchInfo>)>,
-        blockstore_sender: &Sender<(Arc<Vec<Shred>>, Option<BroadcastShredBatchInfo>)>,
+        socket_sender: &Sender<(Arc<Vec<Shred<'static>>>, Option<BroadcastShredBatchInfo>)>,
+        blockstore_sender: &Sender<(Arc<Vec<Shred<'static>>>, Option<BroadcastShredBatchInfo>)>,
         mut broadcast_stage_run: impl BroadcastRun,
     ) -> BroadcastStageReturnType {
         loop {
@@ -373,7 +375,7 @@ impl BroadcastStage {
     fn check_retransmit_signals(
         blockstore: &Blockstore,
         retransmit_slots_receiver: &Receiver<Slot>,
-        socket_sender: &Sender<(Arc<Vec<Shred>>, Option<BroadcastShredBatchInfo>)>,
+        socket_sender: &Sender<(Arc<Vec<Shred<'static>>>, Option<BroadcastShredBatchInfo>)>,
     ) -> Result<()> {
         const RECV_TIMEOUT: Duration = Duration::from_millis(100);
         let retransmit_slots: HashSet<Slot> =
@@ -432,7 +434,7 @@ fn update_peer_stats(
 /// turbine retransmit tree for each shred.
 pub fn broadcast_shreds(
     s: &UdpSocket,
-    shreds: &[Shred],
+    shreds: &[Shred<'static>],
     cluster_nodes_cache: &ClusterNodesCache<BroadcastStage>,
     last_datapoint_submit: &AtomicInterval,
     transmit_stats: &mut TransmitShredsStats,
@@ -466,7 +468,7 @@ pub fn broadcast_shreds(
                         (match protocol {
                             Protocol::QUIC => Either::Right,
                             Protocol::UDP => Either::Left,
-                        })((shred.payload(), addr))
+                        })((shred.payload().to_vec(), addr))
                     })
             })
         })
@@ -535,14 +537,14 @@ pub mod test {
 
     #[allow(clippy::implicit_hasher)]
     #[allow(clippy::type_complexity)]
-    fn make_transmit_shreds(
+    fn make_transmit_shreds<'a>(
         slot: Slot,
         num: u64,
     ) -> (
-        Vec<Shred>,
-        Vec<Shred>,
-        Vec<Arc<Vec<Shred>>>,
-        Vec<Arc<Vec<Shred>>>,
+        Vec<Shred<'a>>,
+        Vec<Shred<'a>>,
+        Vec<Arc<Vec<Shred<'a>>>>,
+        Vec<Arc<Vec<Shred<'a>>>>,
     ) {
         let num_entries = max_ticks_per_n_shreds(num, None);
         let entries = create_ticks(num_entries, /*hashes_per_tick:*/ 0, Hash::default());
