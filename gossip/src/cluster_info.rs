@@ -32,6 +32,7 @@ use {
         epoch_slots::EpochSlots,
         epoch_specs::EpochSpecs,
         gossip_error::GossipError,
+        gossip_service::{SocketConsumeReceiver, SocketConsumeSender},
         ping_pong::Pong,
         protocol::{
             split_gossip_messages, Ping, PingCache, Protocol, PruneData,
@@ -43,7 +44,7 @@ use {
         },
         weighted_shuffle::WeightedShuffle,
     },
-    crossbeam_channel::{Receiver, RecvTimeoutError, Sender},
+    crossbeam_channel::RecvTimeoutError,
     itertools::Itertools,
     rand::{seq::SliceRandom, CryptoRng, Rng},
     rayon::{prelude::*, ThreadPool, ThreadPoolBuilder},
@@ -57,7 +58,7 @@ use {
     },
     solana_perf::{
         data_budget::DataBudget,
-        packet::{Packet, PacketBatch, PacketBatchRecycler, PACKET_DATA_SIZE},
+        packet::{Packet, PacketBatch, PacketBatchRecycler, PACKETS_PER_BATCH, PACKET_DATA_SIZE},
     },
     solana_rayon_threadlimit::get_thread_count,
     solana_runtime::bank_forks::BankForks,
@@ -108,6 +109,7 @@ pub const GOSSIP_SLEEP_MILLIS: u64 = 100;
 /// Chosen to be able to handle 1Gbps of pure gossip traffic
 /// 128MB/PACKET_DATA_SIZE
 const MAX_GOSSIP_TRAFFIC: usize = 128_000_000 / PACKET_DATA_SIZE;
+pub const MAX_GOSSIP_TRAFFIC_BATCHED: usize = MAX_GOSSIP_TRAFFIC.div_ceil(PACKETS_PER_BATCH);
 const GOSSIP_PING_CACHE_CAPACITY: usize = 126976;
 const GOSSIP_PING_CACHE_TTL: Duration = Duration::from_secs(1280);
 const GOSSIP_PING_CACHE_RATE_LIMIT_DELAY: Duration = Duration::from_secs(1280 / 64);
@@ -150,7 +152,7 @@ pub struct ClusterInfo {
     outbound_budget: DataBudget,
     my_contact_info: RwLock<ContactInfo>,
     ping_cache: Mutex<PingCache>,
-    stats: GossipStats,
+    pub(crate) stats: GossipStats,
     local_message_pending_push_queue: Mutex<Vec<CrdsValue>>,
     contact_debug_interval: u64, // milliseconds, 0 = disabled
     contact_save_interval: u64,  // milliseconds, 0 = disabled
@@ -2213,21 +2215,9 @@ impl ClusterInfo {
         thread_pool: &ThreadPool,
         epoch_specs: Option<&mut EpochSpecs>,
         receiver: &PacketBatchReceiver,
-        sender: &Sender<Vec<(/*from:*/ SocketAddr, Protocol)>>,
+        sender: &SocketConsumeSender,
     ) -> Result<(), GossipError> {
         const RECV_TIMEOUT: Duration = Duration::from_secs(1);
-        fn count_dropped_packets(packets: &PacketBatch, dropped_packets_counts: &mut [u64; 7]) {
-            for packet in packets {
-                let k = packet
-                    .data(..4)
-                    .and_then(|data| <[u8; 4]>::try_from(data).ok())
-                    .map(u32::from_le_bytes)
-                    .filter(|&k| k < 6)
-                    .unwrap_or(/*invalid:*/ 6) as usize;
-                dropped_packets_counts[k] += 1;
-            }
-        }
-        let mut dropped_packets_counts = [0u64; 7];
         let mut num_packets = 0;
         let mut packets = VecDeque::with_capacity(2);
         for packet_batch in receiver
@@ -2237,19 +2227,12 @@ impl ClusterInfo {
         {
             num_packets += packet_batch.len();
             packets.push_back(packet_batch);
-            while num_packets > MAX_GOSSIP_TRAFFIC {
-                // Discard older packets in favor of more recent ones.
-                let Some(packet_batch) = packets.pop_front() else {
-                    break;
-                };
-                num_packets -= packet_batch.len();
-                count_dropped_packets(&packet_batch, &mut dropped_packets_counts);
-            }
         }
-        let num_packets_dropped = self.stats.record_dropped_packets(&dropped_packets_counts);
+
         self.stats
             .packets_received_count
-            .add_relaxed(num_packets as u64 + num_packets_dropped);
+            .add_relaxed(num_packets as u64);
+
         fn verify_packet(
             packet: &Packet,
             stakes: &HashMap<Pubkey, u64>,
@@ -2304,7 +2287,7 @@ impl ClusterInfo {
         &self,
         recycler: &PacketBatchRecycler,
         mut epoch_specs: Option<&mut EpochSpecs>,
-        receiver: &Receiver<Vec<(/*from:*/ SocketAddr, Protocol)>>,
+        receiver: &SocketConsumeReceiver,
         response_sender: &PacketBatchSender,
         thread_pool: &ThreadPool,
         last_print: &mut Instant,
@@ -2316,13 +2299,6 @@ impl ClusterInfo {
         let mut packets = VecDeque::from(receiver.recv_timeout(RECV_TIMEOUT)?);
         for payload in receiver.try_iter() {
             packets.extend(payload);
-            let excess_count = packets.len().saturating_sub(MAX_GOSSIP_TRAFFIC);
-            if excess_count > 0 {
-                packets.drain(0..excess_count);
-                self.stats
-                    .gossip_packets_dropped_count
-                    .add_relaxed(excess_count as u64);
-            }
         }
         let stakes = epoch_specs
             .as_mut()
@@ -2355,7 +2331,7 @@ impl ClusterInfo {
         self: Arc<Self>,
         bank_forks: Option<Arc<RwLock<BankForks>>>,
         receiver: PacketBatchReceiver,
-        sender: Sender<Vec<(/*from:*/ SocketAddr, Protocol)>>,
+        sender: SocketConsumeSender,
         exit: Arc<AtomicBool>,
     ) -> JoinHandle<()> {
         let thread_pool = ThreadPoolBuilder::new()
@@ -2389,7 +2365,7 @@ impl ClusterInfo {
     pub(crate) fn listen(
         self: Arc<Self>,
         bank_forks: Option<Arc<RwLock<BankForks>>>,
-        requests_receiver: Receiver<Vec<(/*from:*/ SocketAddr, Protocol)>>,
+        requests_receiver: SocketConsumeReceiver,
         response_sender: PacketBatchSender,
         should_check_duplicate_instance: bool,
         exit: Arc<AtomicBool>,

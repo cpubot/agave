@@ -7,7 +7,7 @@ use {
         sendmmsg::{batch_send, SendPktsError},
         socket::SocketAddrSpace,
     },
-    crossbeam_channel::{Receiver, RecvTimeoutError, SendError, Sender},
+    crossbeam_channel::{bounded, Receiver, RecvTimeoutError, SendError, Sender},
     histogram::Histogram,
     itertools::Itertools,
     solana_packet::Packet,
@@ -37,8 +37,57 @@ pub struct StakedNodes {
     min_stake: u64,
 }
 
+#[derive(Clone)]
+pub struct LossyBoundedSender<T> {
+    sender: Sender<T>,
+    receiver: Receiver<T>,
+    on_drop: Option<Arc<dyn Fn(T) + Send + Sync>>,
+}
+
+pub fn bounded_lossy<T, F>(
+    cap: usize,
+    on_drop: impl Into<Option<F>>,
+) -> (LossyBoundedSender<T>, Receiver<T>)
+where
+    F: Fn(T) + Send + Sync + 'static,
+{
+    let (sender, receiver) = bounded(cap);
+    let sender = LossyBoundedSender {
+        sender,
+        receiver: receiver.clone(),
+        on_drop: on_drop
+            .into()
+            .map(|on_drop| Arc::new(on_drop) as Arc<dyn Fn(T) + Send + Sync>),
+    };
+
+    (sender, receiver)
+}
+
+impl<T> LossyBoundedSender<T> {
+    pub fn send(&self, msg: T) -> std::result::Result<(), SendError<T>> {
+        if self.sender.is_full() {
+            // Drop older messages
+            let dropped_msg = self.receiver.try_recv();
+            if let (Ok(msg), Some(on_drop)) = (dropped_msg, &self.on_drop) {
+                on_drop(msg);
+            }
+        }
+        self.sender.send(msg)
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.sender.is_empty()
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.sender.len()
+    }
+}
+
 pub type PacketBatchReceiver = Receiver<PacketBatch>;
-pub type PacketBatchSender = Sender<PacketBatch>;
+pub type PacketBatchSender = LossyBoundedSender<PacketBatch>;
 
 #[derive(Error, Debug)]
 pub enum StreamerError {
@@ -486,7 +535,7 @@ mod test {
         let addr = read.local_addr().unwrap();
         let send = bind_to_localhost().expect("bind");
         let exit = Arc::new(AtomicBool::new(false));
-        let (s_reader, r_reader) = unbounded();
+        let (s_reader, r_reader) = bounded_lossy::<_, fn(_)>(1624, None);
         let stats = Arc::new(StreamerReceiveStats::new("test"));
         let t_receiver = receiver(
             "solRcvrTest".to_string(),

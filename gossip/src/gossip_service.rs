@@ -1,12 +1,16 @@
 //! The `gossip_service` module implements the network control plane.
 
 use {
-    crate::{cluster_info::ClusterInfo, contact_info::ContactInfo},
-    crossbeam_channel::{unbounded, Sender},
+    crate::{
+        cluster_info::{ClusterInfo, MAX_GOSSIP_TRAFFIC_BATCHED},
+        contact_info::ContactInfo,
+        protocol::Protocol,
+    },
+    crossbeam_channel::{Receiver, Sender},
     rand::{thread_rng, Rng},
     solana_client::{connection_cache::ConnectionCache, tpu_client::TpuClientWrapper},
     solana_net_utils::DEFAULT_IP_ECHO_SERVER_THREADS,
-    solana_perf::recycler::Recycler,
+    solana_perf::{packet::PacketBatch, recycler::Recycler},
     solana_rpc_client::rpc_client::RpcClient,
     solana_runtime::bank_forks::BankForks,
     solana_sdk::{
@@ -15,7 +19,7 @@ use {
     },
     solana_streamer::{
         socket::SocketAddrSpace,
-        streamer::{self, StreamerReceiveStats},
+        streamer::{self, bounded_lossy, LossyBoundedSender, StreamerReceiveStats},
     },
     solana_tpu_client::tpu_client::{TpuClient, TpuClientConfig},
     std::{
@@ -34,6 +38,9 @@ pub struct GossipService {
     thread_hdls: Vec<JoinHandle<()>>,
 }
 
+pub(crate) type SocketConsumeSender = LossyBoundedSender<Vec<(SocketAddr, Protocol)>>;
+pub(crate) type SocketConsumeReceiver = Receiver<Vec<(SocketAddr, Protocol)>>;
+
 impl GossipService {
     pub fn new(
         cluster_info: &Arc<ClusterInfo>,
@@ -44,7 +51,38 @@ impl GossipService {
         stats_reporter_sender: Option<Sender<Box<dyn FnOnce() + Send>>>,
         exit: Arc<AtomicBool>,
     ) -> Self {
-        let (request_sender, request_receiver) = unbounded();
+        let on_drop_packet_batch = {
+            let cluster_info = cluster_info.clone();
+            move |packets| {
+                fn count_dropped_packets(
+                    packets: &PacketBatch,
+                    dropped_packets_counts: &mut [u64; 7],
+                ) {
+                    for packet in packets {
+                        let k = packet
+                            .data(..4)
+                            .and_then(|data| <[u8; 4]>::try_from(data).ok())
+                            .map(u32::from_le_bytes)
+                            .filter(|&k| k < 6)
+                            .unwrap_or(/*invalid:*/ 6) as usize;
+                        dropped_packets_counts[k] += 1;
+                    }
+                }
+                let mut dropped_packets_counts = [0u64; 7];
+                count_dropped_packets(&packets, &mut dropped_packets_counts);
+
+                let num_packets_dropped = cluster_info
+                    .stats
+                    .record_dropped_packets(&dropped_packets_counts);
+                cluster_info
+                    .stats
+                    .packets_received_count
+                    .add_relaxed(num_packets_dropped);
+            }
+        };
+
+        let (request_sender, request_receiver) =
+            bounded_lossy(MAX_GOSSIP_TRAFFIC_BATCHED, on_drop_packet_batch);
         let gossip_socket = Arc::new(gossip_socket);
         trace!(
             "GossipService: id: {}, listening on: {:?}",
@@ -64,14 +102,23 @@ impl GossipService {
             None,
             false,
         );
-        let (consume_sender, listen_receiver) = unbounded();
+        let (consume_sender, listen_receiver) = bounded_lossy(MAX_GOSSIP_TRAFFIC_BATCHED, {
+            let cluster_info = cluster_info.clone();
+            move |packets: Vec<_>| {
+                cluster_info
+                    .stats
+                    .gossip_packets_dropped_count
+                    .add_relaxed(packets.len() as u64);
+            }
+        });
         let t_socket_consume = cluster_info.clone().start_socket_consume_thread(
             bank_forks.clone(),
             request_receiver,
             consume_sender,
             exit.clone(),
         );
-        let (response_sender, response_receiver) = unbounded();
+        let (response_sender, response_receiver) =
+            bounded_lossy::<_, fn(_)>(MAX_GOSSIP_TRAFFIC_BATCHED, None);
         let t_listen = cluster_info.clone().listen(
             bank_forks.clone(),
             listen_receiver,
