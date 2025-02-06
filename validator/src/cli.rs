@@ -1,8 +1,6 @@
 use {
     crate::commands,
-    clap::{
-        crate_description, crate_name, App, AppSettings, Arg, ArgGroup, ArgMatches, SubCommand,
-    },
+    clap::{crate_description, crate_name, App, AppSettings, Arg, ArgMatches, SubCommand},
     log::warn,
     solana_accounts_db::{
         accounts_db::{
@@ -13,8 +11,8 @@ use {
     solana_clap_utils::{
         hidden_unless_forced,
         input_validators::{
-            is_keypair, is_keypair_or_ask_keyword, is_parsable, is_pow2, is_pubkey,
-            is_pubkey_or_keypair, is_slot, is_url_or_moniker, is_within_range,
+            is_keypair_or_ask_keyword, is_parsable, is_pow2, is_pubkey, is_pubkey_or_keypair,
+            is_slot, is_url_or_moniker, is_within_range,
             validate_maximum_full_snapshot_archives_to_retain,
             validate_maximum_incremental_snapshot_archives_to_retain,
         },
@@ -1737,155 +1735,19 @@ pub fn app<'a>(version: &'a str, default_args: &'a DefaultArgs) -> App<'a, 'a> {
         .subcommand(commands::exit::command(default_args))
         .subcommand(commands::authorized_voter::command(default_args))
         .subcommand(commands::contact_info::command(default_args))
-        .subcommand(
-            SubCommand::with_name("repair-shred-from-peer")
-                .about("Request a repair from the specified validator")
-                .arg(
-                    Arg::with_name("pubkey")
-                        .long("pubkey")
-                        .value_name("PUBKEY")
-                        .required(false)
-                        .takes_value(true)
-                        .validator(is_pubkey)
-                        .help("Identity pubkey of the validator to repair from"),
-                )
-                .arg(
-                    Arg::with_name("slot")
-                        .long("slot")
-                        .value_name("SLOT")
-                        .takes_value(true)
-                        .validator(is_parsable::<u64>)
-                        .help("Slot to repair"),
-                )
-                .arg(
-                    Arg::with_name("shred")
-                        .long("shred")
-                        .value_name("SHRED")
-                        .takes_value(true)
-                        .validator(is_parsable::<u64>)
-                        .help("Shred to repair"),
-                ),
-        )
-        .subcommand(
-            SubCommand::with_name("repair-whitelist")
-                .about("Manage the validator's repair protocol whitelist")
-                .setting(AppSettings::SubcommandRequiredElseHelp)
-                .setting(AppSettings::InferSubcommands)
-                .subcommand(
-                    SubCommand::with_name("get")
-                        .about("Display the validator's repair protocol whitelist")
-                        .arg(
-                            Arg::with_name("output")
-                                .long("output")
-                                .takes_value(true)
-                                .value_name("MODE")
-                                .possible_values(&["json", "json-compact"])
-                                .help("Output display mode"),
-                        ),
-                )
-                .subcommand(
-                    SubCommand::with_name("set")
-                        .about("Set the validator's repair protocol whitelist")
-                        .setting(AppSettings::ArgRequiredElseHelp)
-                        .arg(
-                            Arg::with_name("whitelist")
-                                .long("whitelist")
-                                .validator(is_pubkey)
-                                .value_name("VALIDATOR IDENTITY")
-                                .multiple(true)
-                                .takes_value(true)
-                                .help("Set the validator's repair protocol whitelist"),
-                        )
-                        .after_help(
-                            "Note: repair protocol whitelist changes only apply to the currently \
-                             running validator instance",
-                        ),
-                )
-                .subcommand(
-                    SubCommand::with_name("remove-all")
-                        .about("Clear the validator's repair protocol whitelist")
-                        .after_help(
-                            "Note: repair protocol whitelist changes only apply to the currently \
-                             running validator instance",
-                        ),
-                ),
-        )
+        .subcommand(commands::repair_shred_from_peer::command(default_args))
+        .subcommand(commands::repair_whitelist::command(default_args))
         .subcommand(
             SubCommand::with_name("init").about("Initialize the ledger directory then exit"),
         )
         .subcommand(commands::monitor::command(default_args))
         .subcommand(SubCommand::with_name("run").about("Run the validator"))
         .subcommand(commands::plugin::command(default_args))
-        .subcommand(
-            SubCommand::with_name("set-identity")
-                .about("Set the validator identity")
-                .arg(
-                    Arg::with_name("identity")
-                        .index(1)
-                        .value_name("KEYPAIR")
-                        .required(false)
-                        .takes_value(true)
-                        .validator(is_keypair)
-                        .help(
-                            "Path to validator identity keypair [default: read JSON keypair from \
-                             stdin]",
-                        ),
-                )
-                .arg(
-                    clap::Arg::with_name("require_tower")
-                        .long("require-tower")
-                        .takes_value(false)
-                        .help(
-                            "Refuse to set the validator identity if saved tower state is not \
-                             found",
-                        ),
-                )
-                .after_help(
-                    "Note: the new identity only applies to the currently running validator \
-                     instance",
-                ),
-        )
-        .subcommand(
-            SubCommand::with_name("set-log-filter")
-                .about("Adjust the validator log filter")
-                .arg(
-                    Arg::with_name("filter").takes_value(true).index(1).help(
-                        "New filter using the same format as the RUST_LOG environment variable",
-                    ),
-                )
-                .after_help(
-                    "Note: the new filter only applies to the currently running validator instance",
-                ),
-        )
+        .subcommand(commands::set_identity::command(default_args))
+        .subcommand(commands::set_log_filter::command(default_args))
         .subcommand(commands::staked_nodes_overrides::command(default_args))
         .subcommand(commands::wait_for_restart_window::command(default_args))
-        .subcommand(
-            SubCommand::with_name("set-public-address")
-                .about("Specify addresses to advertise in gossip")
-                .arg(
-                    Arg::with_name("tpu_addr")
-                        .long("tpu")
-                        .value_name("HOST:PORT")
-                        .takes_value(true)
-                        .validator(solana_net_utils::is_host_port)
-                        .help("TPU address to advertise in gossip"),
-                )
-                .arg(
-                    Arg::with_name("tpu_forwards_addr")
-                        .long("tpu-forwards")
-                        .value_name("HOST:PORT")
-                        .takes_value(true)
-                        .validator(solana_net_utils::is_host_port)
-                        .help("TPU Forwards address to advertise in gossip"),
-                )
-                .group(
-                    ArgGroup::with_name("set_public_address_details")
-                        .args(&["tpu_addr", "tpu_forwards_addr"])
-                        .required(true)
-                        .multiple(true),
-                )
-                .after_help("Note: At least one arg must be used. Using multiple is ok"),
-        );
+        .subcommand(commands::set_public_address::command(default_args));
 }
 
 /// Deprecated argument description should be moved into the [`deprecated_arguments()`] function,

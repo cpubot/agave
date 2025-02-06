@@ -65,7 +65,7 @@ use {
         clock::{Slot, DEFAULT_SLOTS_PER_EPOCH},
         hash::Hash,
         pubkey::Pubkey,
-        signature::{read_keypair, Keypair, Signer},
+        signature::{Keypair, Signer},
     },
     solana_send_transaction_service::send_transaction_service,
     solana_streamer::{quic::QuicServerParams, socket::SocketAddrSpace},
@@ -95,22 +95,6 @@ enum Operation {
 }
 
 const MILLIS_PER_SECOND: u64 = 1000;
-
-fn set_repair_whitelist(
-    ledger_path: &Path,
-    whitelist: Vec<Pubkey>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let admin_client = admin_rpc_service::connect(ledger_path);
-    admin_rpc_service::runtime()
-        .block_on(async move { admin_client.await?.set_repair_whitelist(whitelist).await })
-        .map_err(|err| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("setRepairWhitelist request failed: {err}"),
-            )
-        })?;
-    Ok(())
-}
 
 // This function is duplicated in ledger-tool/src/main.rs...
 fn hardforks_of(matches: &ArgMatches<'_>, name: &str) -> Option<Vec<Slot>> {
@@ -217,66 +201,11 @@ pub fn main() {
             return;
         }
         ("set-identity", Some(subcommand_matches)) => {
-            let require_tower = subcommand_matches.is_present("require_tower");
-
-            if let Ok(identity_keypair) = value_t!(subcommand_matches, "identity", String) {
-                let identity_keypair = fs::canonicalize(&identity_keypair).unwrap_or_else(|err| {
-                    println!("Unable to access path: {identity_keypair}: {err:?}");
-                    exit(1);
-                });
-                println!(
-                    "New validator identity path: {}",
-                    identity_keypair.display()
-                );
-
-                let admin_client = admin_rpc_service::connect(&ledger_path);
-                admin_rpc_service::runtime()
-                    .block_on(async move {
-                        admin_client
-                            .await?
-                            .set_identity(identity_keypair.display().to_string(), require_tower)
-                            .await
-                    })
-                    .unwrap_or_else(|err| {
-                        println!("setIdentity request failed: {err}");
-                        exit(1);
-                    });
-            } else {
-                let mut stdin = std::io::stdin();
-                let identity_keypair = read_keypair(&mut stdin).unwrap_or_else(|err| {
-                    println!("Unable to read JSON keypair from stdin: {err:?}");
-                    exit(1);
-                });
-                println!("New validator identity: {}", identity_keypair.pubkey());
-
-                let admin_client = admin_rpc_service::connect(&ledger_path);
-                admin_rpc_service::runtime()
-                    .block_on(async move {
-                        admin_client
-                            .await?
-                            .set_identity_from_bytes(
-                                Vec::from(identity_keypair.to_bytes()),
-                                require_tower,
-                            )
-                            .await
-                    })
-                    .unwrap_or_else(|err| {
-                        println!("setIdentityFromBytes request failed: {err}");
-                        exit(1);
-                    });
-            };
-
+            commands::set_identity::execute(subcommand_matches, &ledger_path);
             return;
         }
         ("set-log-filter", Some(subcommand_matches)) => {
-            let filter = value_t_or_exit!(subcommand_matches, "filter", String);
-            let admin_client = admin_rpc_service::connect(&ledger_path);
-            admin_rpc_service::runtime()
-                .block_on(async move { admin_client.await?.set_log_filter(filter).await })
-                .unwrap_or_else(|err| {
-                    println!("set log filter failed: {err}");
-                    exit(1);
-                });
+            commands::set_log_filter::execute(subcommand_matches, &ledger_path);
             return;
         }
         ("wait-for-restart-window", Some(subcommand_matches)) => {
@@ -284,112 +213,15 @@ pub fn main() {
             return;
         }
         ("repair-shred-from-peer", Some(subcommand_matches)) => {
-            let pubkey = value_t!(subcommand_matches, "pubkey", Pubkey).ok();
-            let slot = value_t_or_exit!(subcommand_matches, "slot", u64);
-            let shred_index = value_t_or_exit!(subcommand_matches, "shred", u64);
-            let admin_client = admin_rpc_service::connect(&ledger_path);
-            admin_rpc_service::runtime()
-                .block_on(async move {
-                    admin_client
-                        .await?
-                        .repair_shred_from_peer(pubkey, slot, shred_index)
-                        .await
-                })
-                .unwrap_or_else(|err| {
-                    println!("repair shred from peer failed: {err}");
-                    exit(1);
-                });
+            commands::repair_shred_from_peer::execute(subcommand_matches, &ledger_path);
             return;
         }
         ("repair-whitelist", Some(repair_whitelist_subcommand_matches)) => {
-            match repair_whitelist_subcommand_matches.subcommand() {
-                ("get", Some(subcommand_matches)) => {
-                    let output_mode = subcommand_matches.value_of("output");
-                    let admin_client = admin_rpc_service::connect(&ledger_path);
-                    let repair_whitelist = admin_rpc_service::runtime()
-                        .block_on(async move { admin_client.await?.repair_whitelist().await })
-                        .unwrap_or_else(|err| {
-                            eprintln!("Repair whitelist query failed: {err}");
-                            exit(1);
-                        });
-                    if let Some(mode) = output_mode {
-                        match mode {
-                            "json" => println!(
-                                "{}",
-                                serde_json::to_string_pretty(&repair_whitelist).unwrap()
-                            ),
-                            "json-compact" => {
-                                print!("{}", serde_json::to_string(&repair_whitelist).unwrap())
-                            }
-                            _ => unreachable!(),
-                        }
-                    } else {
-                        print!("{repair_whitelist}");
-                    }
-                    return;
-                }
-                ("set", Some(subcommand_matches)) => {
-                    let whitelist = if subcommand_matches.is_present("whitelist") {
-                        let validators_set: HashSet<_> =
-                            values_t_or_exit!(subcommand_matches, "whitelist", Pubkey)
-                                .into_iter()
-                                .collect();
-                        validators_set.into_iter().collect::<Vec<_>>()
-                    } else {
-                        return;
-                    };
-                    set_repair_whitelist(&ledger_path, whitelist).unwrap_or_else(|err| {
-                        eprintln!("{err}");
-                        exit(1);
-                    });
-                    return;
-                }
-                ("remove-all", _) => {
-                    set_repair_whitelist(&ledger_path, Vec::default()).unwrap_or_else(|err| {
-                        eprintln!("{err}");
-                        exit(1);
-                    });
-                    return;
-                }
-                _ => unreachable!(),
-            }
+            commands::repair_whitelist::execute(repair_whitelist_subcommand_matches, &ledger_path);
+            return;
         }
         ("set-public-address", Some(subcommand_matches)) => {
-            let parse_arg_addr = |arg_name: &str, arg_long: &str| -> Option<SocketAddr> {
-                subcommand_matches.value_of(arg_name).map(|host_port| {
-                    solana_net_utils::parse_host_port(host_port).unwrap_or_else(|err| {
-                        eprintln!(
-                            "Failed to parse --{arg_long} address. It must be in the HOST:PORT \
-                             format. {err}"
-                        );
-                        exit(1);
-                    })
-                })
-            };
-            let tpu_addr = parse_arg_addr("tpu_addr", "tpu");
-            let tpu_forwards_addr = parse_arg_addr("tpu_forwards_addr", "tpu-forwards");
-
-            macro_rules! set_public_address {
-                ($public_addr:expr, $set_public_address:ident, $request:literal) => {
-                    if let Some(public_addr) = $public_addr {
-                        let admin_client = admin_rpc_service::connect(&ledger_path);
-                        admin_rpc_service::runtime()
-                            .block_on(async move {
-                                admin_client.await?.$set_public_address(public_addr).await
-                            })
-                            .unwrap_or_else(|err| {
-                                eprintln!("{} request failed: {err}", $request);
-                                exit(1);
-                            });
-                    }
-                };
-            }
-            set_public_address!(tpu_addr, set_public_tpu_address, "setPublicTpuAddress");
-            set_public_address!(
-                tpu_forwards_addr,
-                set_public_tpu_forwards_address,
-                "setPublicTpuForwardsAddress"
-            );
+            commands::set_public_address::execute(subcommand_matches, &ledger_path);
             return;
         }
         _ => unreachable!(),
