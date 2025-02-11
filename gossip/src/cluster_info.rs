@@ -2189,6 +2189,9 @@ impl ClusterInfo {
         epoch_specs: Option<&mut EpochSpecs>,
         receiver: &PacketBatchReceiver,
         sender: &Sender<Vec<(/*from:*/ SocketAddr, Protocol)>>,
+        max_num_iterations: &mut usize,
+        max_receiver_len: &mut usize,
+        start: &mut Instant,
     ) -> Result<(), GossipError> {
         const RECV_TIMEOUT: Duration = Duration::from_secs(1);
         fn count_dropped_packets(packets: &PacketBatch, dropped_packets_counts: &mut [u64; 7]) {
@@ -2204,12 +2207,12 @@ impl ClusterInfo {
         }
         let mut dropped_packets_counts = [0u64; 7];
         let mut num_packets = 0;
+        let mut num_iterations = 0;
         let mut packets = VecDeque::with_capacity(2);
-        for packet_batch in receiver
-            .recv_timeout(RECV_TIMEOUT)
-            .map(std::iter::once)?
-            .chain(receiver.try_iter())
-        {
+        let initial = receiver.recv_timeout(RECV_TIMEOUT)?;
+        let len = 1 + receiver.len();
+        for packet_batch in std::iter::once(initial).chain(receiver.try_iter()) {
+            num_iterations += 1;
             num_packets += packet_batch.len();
             packets.push_back(packet_batch);
             while num_packets > MAX_GOSSIP_TRAFFIC {
@@ -2221,6 +2224,23 @@ impl ClusterInfo {
                 count_dropped_packets(&packet_batch, &mut dropped_packets_counts);
             }
         }
+
+        if *max_num_iterations < num_iterations {
+            *max_num_iterations = num_iterations;
+            info!("run_socket_consume: max num_iterations {num_iterations}");
+        }
+        if *max_receiver_len < len {
+            *max_receiver_len = len;
+            info!("run_socket_consume: max receiver len {len}");
+        }
+
+        let now = Instant::now();
+        if now.duration_since(*start) >= Duration::from_secs(60) {
+            *start = now;
+            *max_num_iterations = 0;
+            *max_receiver_len = 0;
+        }
+
         let num_packets_dropped = self.stats.record_dropped_packets(&dropped_packets_counts);
         self.stats
             .packets_received_count
@@ -2340,12 +2360,18 @@ impl ClusterInfo {
             .unwrap();
         let mut epoch_specs = bank_forks.map(EpochSpecs::from);
         let run_consume = move || {
+            let mut max_num_iterations = 0;
+            let mut max_receiver_len = 0;
+            let mut start = Instant::now();
             while !exit.load(Ordering::Relaxed) {
                 match self.run_socket_consume(
                     &thread_pool,
                     epoch_specs.as_mut(),
                     &receiver,
                     &sender,
+                    &mut max_num_iterations,
+                    &mut max_receiver_len,
+                    &mut start,
                 ) {
                     Err(GossipError::RecvTimeoutError(RecvTimeoutError::Disconnected)) => break,
                     Err(GossipError::RecvTimeoutError(RecvTimeoutError::Timeout)) => (),
