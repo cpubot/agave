@@ -1939,7 +1939,7 @@ impl ClusterInfo {
 
     fn process_packets(
         &self,
-        packets: Vec<(/*from:*/ SocketAddr, Protocol)>,
+        packets: &mut Vec<(/*from:*/ SocketAddr, Protocol)>,
         thread_pool: &ThreadPool,
         recycler: &PacketBatchRecycler,
         response_sender: &PacketBatchSender,
@@ -1949,28 +1949,14 @@ impl ClusterInfo {
     ) -> Result<(), GossipError> {
         let _st = ScopedTimer::from(&self.stats.process_gossip_packets_time);
         let self_pubkey = self.id();
-        // Filter out values if the shred-versions are different.
-        let self_shred_version = self.my_shred_version();
-        let packets = if self_shred_version == 0 {
-            packets
-        } else {
-            let gossip_crds = self.gossip.crds.read().unwrap();
-            thread_pool.install(|| {
-                packets
-                    .into_par_iter()
-                    .with_min_len(1024)
-                    .filter_map(|(from, msg)| {
-                        let msg = filter_on_shred_version(
-                            msg,
-                            self_shred_version,
-                            &gossip_crds,
-                            &self.stats,
-                        )?;
-                        Some((from, msg))
-                    })
-                    .collect()
-            })
-        };
+
+        // Split packets based on their types.
+        let mut pull_requests = vec![];
+        let mut pull_responses = vec![];
+        let mut push_messages = vec![];
+        let mut prune_messages = vec![];
+        let mut ping_messages = vec![];
+        let mut pong_messages = vec![];
 
         // Check if there is a duplicate instance of
         // this node with more recent timestamp.
@@ -2004,14 +1990,8 @@ impl ClusterInfo {
                 false
             }
         };
-        // Split packets based on their types.
-        let mut pull_requests = vec![];
-        let mut pull_responses = vec![];
-        let mut push_messages = vec![];
-        let mut prune_messages = vec![];
-        let mut ping_messages = vec![];
-        let mut pong_messages = vec![];
-        for (from_addr, packet) in packets {
+
+        let extract_packet = |(from_addr, packet)| {
             match packet {
                 Protocol::PullRequest(filter, caller) => {
                     let request = PullRequest {
@@ -2051,7 +2031,36 @@ impl ClusterInfo {
                 Protocol::PingMessage(ping) => ping_messages.push((from_addr, ping)),
                 Protocol::PongMessage(pong) => pong_messages.push((from_addr, pong)),
             }
+            Ok::<_, GossipError>(())
+        };
+
+        // Filter out values if the shred-versions are different.
+        let self_shred_version = self.my_shred_version();
+        if self_shred_version == 0 {
+            packets.drain(..).try_for_each(extract_packet)?;
+        } else {
+            let gossip_crds = self.gossip.crds.read().unwrap();
+
+            thread_pool
+                .install(|| {
+                    packets
+                        .par_drain(..)
+                        .with_min_len(1024)
+                        .filter_map(|(from, msg)| {
+                            let msg = filter_on_shred_version(
+                                msg,
+                                self_shred_version,
+                                &gossip_crds,
+                                &self.stats,
+                            )?;
+                            Some((from, msg))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .into_iter()
+                .try_for_each(extract_packet)?;
         }
+
         let pings = pings
             .into_iter()
             .map(|(addr, ping)| (addr, Protocol::PingMessage(ping)));
@@ -2166,16 +2175,17 @@ impl ClusterInfo {
         thread_pool: &ThreadPool,
         last_print: &mut Instant,
         should_check_duplicate_instance: bool,
+        packet_buf: &mut Vec<(/*from:*/ SocketAddr, Protocol)>,
     ) -> Result<(), GossipError> {
         let _st = ScopedTimer::from(&self.stats.gossip_listen_loop_time);
         const RECV_TIMEOUT: Duration = Duration::from_secs(1);
         const SUBMIT_GOSSIP_STATS_INTERVAL: Duration = Duration::from_secs(2);
-        let mut packets = receiver.recv_timeout(RECV_TIMEOUT)?;
+        packet_buf.extend(receiver.recv_timeout(RECV_TIMEOUT)?);
         for payload in receiver.try_iter() {
-            packets.extend(payload);
-            if packets.len() >= MAX_GOSSIP_TRAFFIC {
+            if packet_buf.len() + payload.len() > MAX_GOSSIP_TRAFFIC {
                 break;
             }
+            packet_buf.extend(payload);
         }
         let stakes = epoch_specs
             .as_mut()
@@ -2186,7 +2196,7 @@ impl ClusterInfo {
             .map(EpochSpecs::epoch_duration)
             .unwrap_or(DEFAULT_EPOCH_DURATION);
         self.process_packets(
-            packets,
+            packet_buf,
             thread_pool,
             recycler,
             response_sender,
@@ -2194,6 +2204,7 @@ impl ClusterInfo {
             epoch_duration,
             should_check_duplicate_instance,
         )?;
+        packet_buf.clear();
         if last_print.elapsed() > SUBMIT_GOSSIP_STATS_INTERVAL {
             submit_gossip_stats(&self.stats, &self.gossip, &stakes);
             *last_print = Instant::now();
@@ -2261,6 +2272,7 @@ impl ClusterInfo {
             .name("solGossipListen".to_string())
             .spawn(move || {
                 while !exit.load(Ordering::Relaxed) {
+                    let mut packet_buf = Vec::with_capacity(MAX_GOSSIP_TRAFFIC);
                     if let Err(err) = self.run_listen(
                         &recycler,
                         epoch_specs.as_mut(),
@@ -2269,6 +2281,7 @@ impl ClusterInfo {
                         &thread_pool,
                         &mut last_print,
                         should_check_duplicate_instance,
+                        &mut packet_buf,
                     ) {
                         match err {
                             GossipError::RecvTimeoutError(RecvTimeoutError::Disconnected) => break,
