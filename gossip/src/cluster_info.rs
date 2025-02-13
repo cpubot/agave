@@ -2039,10 +2039,10 @@ impl ClusterInfo {
         if self_shred_version == 0 {
             packets.drain(..).try_for_each(extract_packet)?;
         } else {
-            let gossip_crds = self.gossip.crds.read().unwrap();
+            {
+                let gossip_crds = self.gossip.crds.read().unwrap();
 
-            thread_pool
-                .install(|| {
+                thread_pool.install(|| {
                     packets
                         .par_drain(..)
                         .with_min_len(1024)
@@ -2057,8 +2057,9 @@ impl ClusterInfo {
                         })
                         .collect::<Vec<_>>()
                 })
-                .into_iter()
-                .try_for_each(extract_packet)?;
+            }
+            .into_iter()
+            .try_for_each(extract_packet)?;
         }
 
         let pings = pings
