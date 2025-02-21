@@ -94,7 +94,7 @@ pub struct StreamerReceiveStats {
     pub packet_batches_count: AtomicUsize,
     pub full_packet_batches_count: AtomicUsize,
     pub max_channel_len: AtomicUsize,
-    pub recv_from_time: Counter,
+    pub send_time: Counter,
 }
 
 impl StreamerReceiveStats {
@@ -105,7 +105,7 @@ impl StreamerReceiveStats {
             packet_batches_count: AtomicUsize::default(),
             full_packet_batches_count: AtomicUsize::default(),
             max_channel_len: AtomicUsize::default(),
-            recv_from_time: Counter::default(),
+            send_time: Counter::default(),
         }
     }
 
@@ -132,7 +132,7 @@ impl StreamerReceiveStats {
                 self.max_channel_len.swap(0, Ordering::Relaxed) as i64,
                 i64
             ),
-            ("recv_from_time", self.recv_from_time.clear(), i64),
+            ("send_time", self.send_time.clear(), i64),
         );
     }
 }
@@ -171,7 +171,7 @@ fn recv_loop(
             }
 
             if let Ok(len) = packet::recv_from(&mut packet_batch, socket, coalesce) {
-                let _st = ScopedTimer::from(&stats.recv_from_time);
+                let _st = ScopedTimer::from(&stats.send_time);
                 if len > 0 {
                     let StreamerReceiveStats {
                         packets_count,
