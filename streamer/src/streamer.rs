@@ -63,6 +63,12 @@ pub(crate) struct ScopedTimer<'a> {
     metric: &'a AtomicU64,
 }
 
+impl Counter {
+    fn clear(&self) -> u64 {
+        self.0.swap(0, Ordering::Relaxed)
+    }
+}
+
 impl<'a> From<&'a Counter> for ScopedTimer<'a> {
     // Output should be assigned to a *named* variable, otherwise it is
     // immediately dropped.
@@ -89,7 +95,7 @@ pub struct StreamerReceiveStats {
     pub full_packet_batches_count: AtomicUsize,
     pub max_channel_len: AtomicUsize,
     pub num_packets_dropped: AtomicUsize,
-    pub recv_from_time: Counter,
+    pub send_time: Counter,
 }
 
 impl StreamerReceiveStats {
@@ -101,7 +107,7 @@ impl StreamerReceiveStats {
             full_packet_batches_count: AtomicUsize::default(),
             max_channel_len: AtomicUsize::default(),
             num_packets_dropped: AtomicUsize::default(),
-            recv_from_time: Counter::default(),
+            send_time: Counter::default(),
         }
     }
 
@@ -133,7 +139,7 @@ impl StreamerReceiveStats {
                 self.num_packets_dropped.swap(0, Ordering::Relaxed) as i64,
                 i64
             ),
-            ("recv_from_time", self.recv_from_time.clear(), i64),
+            ("send_time", self.send_time.clear(), i64),
         );
     }
 }
@@ -172,7 +178,7 @@ fn recv_loop(
             }
 
             if let Ok(len) = packet::recv_from(&mut packet_batch, socket, coalesce) {
-                let _st = ScopedTimer::from(&stats.recv_from_time);
+                let _st = ScopedTimer::from(&stats.send_time);
                 if len > 0 {
                     let StreamerReceiveStats {
                         packets_count,
