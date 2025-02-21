@@ -114,6 +114,9 @@ pub const MAX_GOSSIP_TRAFFIC_BATCHED: usize = MAX_GOSSIP_TRAFFIC.div_ceil(28);
 const GOSSIP_PING_CACHE_CAPACITY: usize = 126976;
 const GOSSIP_PING_CACHE_TTL: Duration = Duration::from_secs(1280);
 const GOSSIP_PING_CACHE_RATE_LIMIT_DELAY: Duration = Duration::from_secs(1280 / 64);
+/// Cap for intermediate consume / listen buffers at 1000 packet batches to avoid
+/// madvise overhead of dropping `MAX_GOSSIP_TRAFFIC_BATCHED` packet batches.
+const CHANNEL_CONSUME_CAPACITY: usize = 1000;
 pub const DEFAULT_CONTACT_DEBUG_INTERVAL_MILLIS: u64 = 10_000;
 pub const DEFAULT_CONTACT_SAVE_INTERVAL_MILLIS: u64 = 60_000;
 // Limit number of unique pubkeys in the crds table.
@@ -2086,6 +2089,7 @@ impl ClusterInfo {
         epoch_specs: Option<&mut EpochSpecs>,
         receiver: &PacketBatchReceiver,
         sender: &Sender<Vec<(/*from:*/ SocketAddr, Protocol)>>,
+        packet_buf: &mut Vec<PacketBatch>,
     ) -> Result<(), GossipError> {
         const RECV_TIMEOUT: Duration = Duration::from_secs(1);
         fn count_dropped_packets(packets: &PacketBatch, dropped_packets_counts: &mut [u64; 7]) {
@@ -2101,10 +2105,19 @@ impl ClusterInfo {
         }
 
         let _st = ScopedTimer::from(&self.stats.run_socket_consume_time);
-        let packet_batch = receiver.recv_timeout(RECV_TIMEOUT)?;
+        packet_buf.push(receiver.recv_timeout(RECV_TIMEOUT)?);
+        let mut num_packets = 0;
+        while let Ok(packet_batch) = receiver.try_recv() {
+            num_packets += packet_batch.len();
+            packet_buf.push(packet_batch);
+            if packet_buf.len() == CHANNEL_CONSUME_CAPACITY {
+                break;
+            }
+        }
+
         self.stats
             .packets_received_count
-            .add_relaxed(packet_batch.len() as u64);
+            .add_relaxed(num_packets as u64);
 
         fn verify_packet(
             packet: &Packet,
@@ -2138,17 +2151,27 @@ impl ClusterInfo {
         let packets: Vec<_> = {
             let _st = ScopedTimer::from(&self.stats.verify_gossip_packets_time);
             thread_pool.install(|| {
-                packet_batch
-                    .par_iter()
-                    .filter_map(|packet| verify_packet(packet, &stakes, &self.stats))
-                    .collect()
+                if packet_buf.len() == 1 {
+                    packet_buf[0]
+                        .iter()
+                        .filter_map(|packet| verify_packet(packet, &stakes, &self.stats))
+                        .collect()
+                } else {
+                    packet_buf
+                        .par_iter()
+                        .flatten()
+                        .filter_map(|packet| verify_packet(packet, &stakes, &self.stats))
+                        .collect()
+                }
             })
         };
 
         if !packets.is_empty() {
             if let Err(TrySendError::Full(_)) = sender.try_send(packets) {
                 let mut dropped_packets_counts = [0u64; 7];
-                count_dropped_packets(&packet_batch, &mut dropped_packets_counts);
+                for packet_batch in packet_buf.iter() {
+                    count_dropped_packets(packet_batch, &mut dropped_packets_counts);
+                }
                 let num_packets_dropped =
                     self.stats.record_dropped_packets(&dropped_packets_counts);
                 self.stats
@@ -2156,6 +2179,8 @@ impl ClusterInfo {
                     .add_relaxed(num_packets_dropped);
             }
         }
+
+        packet_buf.clear();
 
         Ok(())
     }
@@ -2173,13 +2198,10 @@ impl ClusterInfo {
     ) -> Result<(), GossipError> {
         let _st = ScopedTimer::from(&self.stats.gossip_listen_loop_time);
         const RECV_TIMEOUT: Duration = Duration::from_secs(1);
-        for pkts in receiver
-            .recv_timeout(RECV_TIMEOUT)
-            .map(std::iter::once)?
-            .chain(receiver.try_iter())
-        {
+        packet_buf.push(receiver.recv_timeout(RECV_TIMEOUT)?);
+        while let Ok(pkts) = receiver.try_recv() {
             packet_buf.push(pkts);
-            if packet_buf.len() == MAX_GOSSIP_TRAFFIC_BATCHED {
+            if packet_buf.len() == CHANNEL_CONSUME_CAPACITY {
                 break;
             }
         }
@@ -2220,6 +2242,7 @@ impl ClusterInfo {
             .thread_name(|i| format!("solGossipCons{i:02}"))
             .build()
             .unwrap();
+        let mut packet_buf = Vec::with_capacity(CHANNEL_CONSUME_CAPACITY);
         let mut epoch_specs = bank_forks.map(EpochSpecs::from);
         let run_consume = move || {
             while !exit.load(Ordering::Relaxed) {
@@ -2228,6 +2251,7 @@ impl ClusterInfo {
                     epoch_specs.as_mut(),
                     &receiver,
                     &sender,
+                    &mut packet_buf,
                 ) {
                     Err(GossipError::RecvTimeoutError(RecvTimeoutError::Disconnected)) => break,
                     Err(GossipError::RecvTimeoutError(RecvTimeoutError::Timeout)) => (),
@@ -2258,11 +2282,10 @@ impl ClusterInfo {
             .build()
             .unwrap();
         let mut epoch_specs = bank_forks.map(EpochSpecs::from);
+        let mut packet_buf = Vec::with_capacity(CHANNEL_CONSUME_CAPACITY);
         Builder::new()
             .name("solGossipListen".to_string())
             .spawn(move || {
-                let mut packet_buf = Vec::with_capacity(MAX_GOSSIP_TRAFFIC_BATCHED);
-
                 while !exit.load(Ordering::Relaxed) {
                     if let Err(err) = self.run_listen(
                         &recycler,
