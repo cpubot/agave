@@ -18,7 +18,7 @@ use {
         collections::HashMap,
         net::{IpAddr, UdpSocket},
         sync::{
-            atomic::{AtomicBool, AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
             Arc,
         },
         thread::{sleep, Builder, JoinHandle},
@@ -55,12 +55,46 @@ pub enum StreamerError {
     SendPktsError(#[from] SendPktsError),
 }
 
+#[derive(Default)]
+pub struct Counter(AtomicU64);
+
+impl Counter {
+    fn clear(&self) -> u64 {
+        self.0.swap(0, Ordering::Relaxed)
+    }
+}
+
+pub struct ScopedTimer<'a> {
+    clock: Instant,
+    metric: &'a AtomicU64,
+}
+
+impl<'a> From<&'a Counter> for ScopedTimer<'a> {
+    // Output should be assigned to a *named* variable, otherwise it is
+    // immediately dropped.
+    #[must_use]
+    fn from(counter: &'a Counter) -> Self {
+        Self {
+            clock: Instant::now(),
+            metric: &counter.0,
+        }
+    }
+}
+
+impl Drop for ScopedTimer<'_> {
+    fn drop(&mut self) {
+        let micros = self.clock.elapsed().as_micros();
+        self.metric.fetch_add(micros as u64, Ordering::Relaxed);
+    }
+}
+
 pub struct StreamerReceiveStats {
     pub name: &'static str,
     pub packets_count: AtomicUsize,
     pub packet_batches_count: AtomicUsize,
     pub full_packet_batches_count: AtomicUsize,
     pub max_channel_len: AtomicUsize,
+    pub recv_from_time: Counter,
 }
 
 impl StreamerReceiveStats {
@@ -71,6 +105,7 @@ impl StreamerReceiveStats {
             packet_batches_count: AtomicUsize::default(),
             full_packet_batches_count: AtomicUsize::default(),
             max_channel_len: AtomicUsize::default(),
+            recv_from_time: Counter::default(),
         }
     }
 
@@ -97,6 +132,7 @@ impl StreamerReceiveStats {
                 self.max_channel_len.swap(0, Ordering::Relaxed) as i64,
                 i64
             ),
+            ("recv_from_time", self.recv_from_time.clear(), i64),
         );
     }
 }
@@ -135,6 +171,7 @@ fn recv_loop(
             }
 
             if let Ok(len) = packet::recv_from(&mut packet_batch, socket, coalesce) {
+                let _st = ScopedTimer::from(&stats.recv_from_time);
                 if len > 0 {
                     let StreamerReceiveStats {
                         packets_count,
