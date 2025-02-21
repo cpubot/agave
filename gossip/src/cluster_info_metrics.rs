@@ -156,6 +156,7 @@ pub struct GossipStats {
     pub(crate) push_message_value_count: Counter,
     pub(crate) push_vote_read: Counter,
     pub(crate) repair_peers: Counter,
+    pub(crate) run_socket_consume_time: Counter,
     pub(crate) save_contact_info_time: Counter,
     pub(crate) skip_pull_response_shred_version: Counter,
     pub(crate) skip_pull_shred_version: Counter,
@@ -286,6 +287,11 @@ pub(crate) fn submit_gossip_stats(
         (
             "process_gossip_packets_time",
             stats.process_gossip_packets_time.clear(),
+            i64
+        ),
+        (
+            "run_socket_consume_time",
+            stats.run_socket_consume_time.clear(),
             i64
         ),
         (
