@@ -2088,25 +2088,14 @@ impl ClusterInfo {
         epoch_specs: Option<&mut EpochSpecs>,
         receiver: &PacketBatchReceiver,
         sender: &Sender<Vec<(/*from:*/ SocketAddr, Protocol)>>,
-        packet_buf: &mut Vec<PacketBatch>,
     ) -> Result<(), GossipError> {
         const RECV_TIMEOUT: Duration = Duration::from_secs(1);
 
-        let mut num_packets = 0;
-        for packet_batch in receiver
-            .recv_timeout(RECV_TIMEOUT)
-            .map(std::iter::once)?
-            .chain(receiver.try_iter())
-        {
-            num_packets += packet_batch.len();
-            packet_buf.push(packet_batch);
-            if packet_buf.len() == MAX_GOSSIP_TRAFFIC_BATCHED {
-                break;
-            }
-        }
+        let packet_batch = receiver.recv_timeout(RECV_TIMEOUT)?;
         self.stats
             .packets_received_count
-            .add_relaxed(num_packets as u64);
+            .add_relaxed(packet_batch.len() as u64);
+
         fn verify_packet(
             packet: &Packet,
             stakes: &HashMap<Pubkey, u64>,
@@ -2139,22 +2128,17 @@ impl ClusterInfo {
         let packets: Vec<_> = {
             let _st = ScopedTimer::from(&self.stats.verify_gossip_packets_time);
             thread_pool.install(|| {
-                if packet_buf.len() == 1 {
-                    packet_buf[0]
-                        .par_iter()
-                        .filter_map(|packet| verify_packet(packet, &stakes, &self.stats))
-                        .collect()
-                } else {
-                    packet_buf
-                        .par_iter()
-                        .flatten()
-                        .filter_map(|packet| verify_packet(packet, &stakes, &self.stats))
-                        .collect()
-                }
+                packet_batch
+                    .par_iter()
+                    .filter_map(|packet| verify_packet(packet, &stakes, &self.stats))
+                    .collect()
             })
         };
-        _ = sender.try_send(packets);
-        packet_buf.clear();
+
+        if !packets.is_empty() {
+            _ = sender.try_send(packets);
+        }
+
         Ok(())
     }
 
@@ -2226,15 +2210,12 @@ impl ClusterInfo {
             .unwrap();
         let mut epoch_specs = bank_forks.map(EpochSpecs::from);
         let run_consume = move || {
-            let mut packet_buf = Vec::with_capacity(MAX_GOSSIP_TRAFFIC_BATCHED);
-
             while !exit.load(Ordering::Relaxed) {
                 match self.run_socket_consume(
                     &thread_pool,
                     epoch_specs.as_mut(),
                     &receiver,
                     &sender,
-                    &mut packet_buf,
                 ) {
                     Err(GossipError::RecvTimeoutError(RecvTimeoutError::Disconnected)) => break,
                     Err(GossipError::RecvTimeoutError(RecvTimeoutError::Timeout)) => (),
