@@ -47,6 +47,7 @@ wincode = { workspace = true }
 [dev-dependencies]
 agave-reserved-account-keys = { workspace = true }
 assert_matches = { workspace = true }
+criterion = { workspace = true }
 proptest = { workspace = true }
 solana-entry = { path = ".", features = ["dev-context-only-utils"] }
 solana-keypair = { workspace = true }
@@ -61,3 +62,7 @@ solana-transaction = { workspace = true, features = ["verify"] }
 
 [[bench]]
 name = "entry_sigverify"
+
+[[bench]]
+name = "entry_serde"
+harness = false
