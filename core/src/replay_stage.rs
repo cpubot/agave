@@ -4088,7 +4088,7 @@ impl ReplayStage {
                     "validator fork not confirmed {} {}ms {:?}",
                     *slot,
                     duration,
-                    voted_stakes.get(slot)
+                    voted_stakes.get(*slot)
                 );
             }
         }

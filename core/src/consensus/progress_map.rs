@@ -12,7 +12,10 @@ use {
     solana_runtime::{bank::Bank, bank_forks::BankForks},
     solana_vote::vote_account::VoteAccountsHashMap,
     std::{
-        collections::{BTreeMap, HashMap, HashSet},
+        collections::{HashMap, HashSet},
+        iter::Enumerate,
+        marker::PhantomData,
+        ops::Index,
         sync::{Arc, RwLock},
         time::Instant,
     },
@@ -20,7 +23,261 @@ use {
 
 type VotedSlot = Slot;
 type ExpirationSlot = Slot;
-pub type LockoutIntervals = BTreeMap<ExpirationSlot, Vec<(VotedSlot, Pubkey)>>;
+
+#[derive(Clone, Copy, Debug)]
+pub struct LockoutInterval {
+    pub voter: Pubkey,
+    pub start: VotedSlot,
+    pub end: ExpirationSlot,
+}
+
+pub type LockoutIntervals = Vec<LockoutInterval>;
+
+#[derive(Default, Debug, Clone)]
+pub struct VecMap<K, V> {
+    inner: Vec<Option<V>>,
+    start: usize,
+    end: usize,
+    _k: PhantomData<K>,
+}
+
+impl<K, V> VecMap<K, V> {
+    pub fn new() -> Self {
+        Self {
+            inner: Vec::new(),
+            start: 0,
+            end: 0,
+            _k: PhantomData,
+        }
+    }
+}
+
+impl<K, V> Index<&K> for VecMap<K, V>
+where
+    usize: TryFrom<K>,
+    K: Copy,
+{
+    type Output = V;
+    fn index(&self, index: &K) -> &Self::Output {
+        self.inner[self.mapped_key(*index).unwrap()]
+            .as_ref()
+            .unwrap()
+    }
+}
+
+impl<K, V> VecMap<K, V>
+where
+    usize: TryFrom<K>,
+    K: Copy,
+{
+    pub fn from_range(start: K, end: K) -> Self {
+        let start = start
+            .try_into()
+            .unwrap_or_else(|_| panic!("Failed to convert start to usize"));
+        let end = end
+            .try_into()
+            .unwrap_or_else(|_| panic!("Failed to convert end to usize"));
+        Self {
+            inner: (start..=end).map(|_| None).collect(),
+            start,
+            end,
+            _k: PhantomData,
+        }
+    }
+
+    fn ensure_capacity(&mut self, key: K) {
+        let key: usize = key
+            .try_into()
+            .unwrap_or_else(|_| panic!("Failed to convert key to usize"));
+        if self.inner.is_empty() {
+            self.inner.push(None);
+            self.start = key;
+            self.end = key;
+            return;
+        }
+        let rem = key.saturating_sub(self.end);
+        // key > end
+        if rem != 0 {
+            self.end = key;
+            self.inner.extend((0..rem).map(|_| None));
+            return;
+        }
+        let rem = self.start.saturating_sub(key);
+        // key < start
+        if rem != 0 {
+            self.start = key;
+            self.inner.splice(0..0, (0..rem).map(|_| None));
+        }
+    }
+
+    #[inline]
+    fn mapped_key(&self, key: K) -> Option<usize> {
+        let key: usize = key
+            .try_into()
+            .unwrap_or_else(|_| panic!("Failed to convert key to usize"));
+        if key < self.start || key > self.end || self.inner.is_empty() {
+            return None;
+        }
+        Some(unsafe { key.unchecked_sub(self.start) })
+    }
+
+    #[inline]
+    fn mapped_key_unchecked(&self, key: K) -> usize {
+        let key: usize = key
+            .try_into()
+            .unwrap_or_else(|_| panic!("Failed to convert key to usize"));
+        unsafe { key.unchecked_sub(self.start) }
+    }
+
+    #[inline]
+    pub fn entry(&mut self, key: K) -> &mut Option<V> {
+        self.ensure_capacity(key);
+        let key = self.mapped_key_unchecked(key);
+        &mut self.inner[key]
+    }
+
+    #[inline]
+    pub fn insert(&mut self, key: K, value: V) {
+        self.ensure_capacity(key);
+        let key = self.mapped_key_unchecked(key);
+        self.inner[key] = Some(value);
+    }
+
+    #[inline]
+    pub fn get(&self, key: K) -> Option<&V> {
+        let key = self.mapped_key(key)?;
+        self.inner[key].as_ref()
+    }
+}
+
+impl<K, V> FromIterator<(K, V)> for VecMap<K, V>
+where
+    usize: TryFrom<K>,
+    K: Copy,
+{
+    fn from_iter<T: IntoIterator<Item = (K, V)>>(iter: T) -> Self {
+        let mut slf = Self::new();
+        for (key, value) in iter {
+            slf.insert(key, value);
+        }
+        slf
+    }
+}
+
+#[inline]
+fn recover_key<K>(index: usize, start: usize) -> K
+where
+    K: TryFrom<usize>,
+{
+    (index + start)
+        .try_into()
+        .unwrap_or_else(|_| panic!("Failed to convert index to K"))
+}
+
+impl<K, V> VecMap<K, V>
+where
+    K: TryFrom<usize>,
+{
+    pub fn iter(&self) -> impl Iterator<Item = (K, &V)> {
+        self.inner
+            .iter()
+            .enumerate()
+            .filter_map(|(i, v)| v.as_ref().map(|v| (recover_key(i, self.start), v)))
+    }
+}
+
+pub struct VecMapIntoIter<K, V> {
+    inner: Enumerate<std::vec::IntoIter<Option<V>>>,
+    start: usize,
+    _k: PhantomData<K>,
+}
+
+impl<K, V> Iterator for VecMapIntoIter<K, V>
+where
+    K: TryFrom<usize>,
+{
+    type Item = (K, V);
+    fn next(&mut self) -> Option<Self::Item> {
+        for (i, v) in self.inner.by_ref() {
+            if let Some(v) = v {
+                return Some((recover_key(i, self.start), v));
+            }
+        }
+        None
+    }
+}
+
+impl<K, V> IntoIterator for VecMap<K, V>
+where
+    K: TryFrom<usize>,
+{
+    type Item = (K, V);
+    type IntoIter = VecMapIntoIter<K, V>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        VecMapIntoIter {
+            inner: self.inner.into_iter().enumerate(),
+            start: self.start,
+            _k: PhantomData,
+        }
+    }
+}
+
+pub struct VecSet<K> {
+    inner: VecMap<K, ()>,
+}
+
+impl<K> VecSet<K>
+where
+    usize: TryFrom<K>,
+    K: Copy,
+{
+    pub fn from_range(start: K, end: K) -> Self {
+        Self {
+            inner: VecMap::from_range(start, end),
+        }
+    }
+
+    pub fn insert(&mut self, key: K) {
+        *self.inner.entry(key) = Some(());
+    }
+}
+
+pub struct VecSetIntoIter<K> {
+    inner: Enumerate<std::vec::IntoIter<Option<()>>>,
+    start: usize,
+    _k: PhantomData<K>,
+}
+
+impl<K> Iterator for VecSetIntoIter<K>
+where
+    K: TryFrom<usize>,
+{
+    type Item = K;
+    fn next(&mut self) -> Option<Self::Item> {
+        for (i, v) in self.inner.by_ref() {
+            if v.is_some() {
+                return Some(recover_key(i, self.start));
+            }
+        }
+        None
+    }
+}
+
+impl<K> IntoIterator for VecSet<K>
+where
+    K: TryFrom<usize>,
+{
+    type Item = K;
+    type IntoIter = VecSetIntoIter<K>;
+    fn into_iter(self) -> Self::IntoIter {
+        VecSetIntoIter {
+            inner: self.inner.inner.into_iter().enumerate(),
+            start: self.inner.start,
+            _k: PhantomData,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct ValidatorStakeInfo {

@@ -82,6 +82,7 @@ impl VoteAccount {
         self.0.account.owner()
     }
 
+    #[inline]
     pub fn vote_state_view(&self) -> &VoteStateView {
         &self.0.vote_state_view
     }

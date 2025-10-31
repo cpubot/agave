@@ -1,9 +1,7 @@
 use {
-    crate::consensus::heaviest_subtree_fork_choice::SlotHashKey,
-    solana_clock::Slot,
-    solana_hash::Hash,
-    solana_pubkey::Pubkey,
-    std::collections::{hash_map::Entry, HashMap},
+    crate::consensus::heaviest_subtree_fork_choice::SlotHashKey, ahash::HashMap,
+    solana_clock::Slot, solana_hash::Hash, solana_pubkey::Pubkey,
+    std::collections::hash_map::Entry,
 };
 
 #[derive(Default)]
@@ -46,7 +44,8 @@ impl LatestValidatorVotesForFrozenBanks {
                                 .insert(vote_pubkey, (vote_slot, vec![frozen_hash]));
                         }
                         *latest_frozen_vote_slot = vote_slot;
-                        *latest_frozen_vote_hashes = vec![frozen_hash];
+                        latest_frozen_vote_hashes.clear();
+                        latest_frozen_vote_hashes.push(frozen_hash);
                         return (true, Some(vote_slot));
                     } else if vote_slot == *latest_frozen_vote_slot
                         && !latest_frozen_vote_hashes.contains(&frozen_hash)
