@@ -1,5 +1,6 @@
 pub mod fork_choice;
 pub mod heaviest_subtree_fork_choice;
+pub mod index_map;
 pub(crate) mod latest_validator_votes_for_frozen_banks;
 pub mod progress_map;
 mod tower1_14_11;
@@ -20,10 +21,11 @@ use {
         tower_vote_state::TowerVoteState,
     },
     crate::{
-        consensus::progress_map::{LockoutInterval, VecMap, VecSet},
+        consensus::{index_map::IndexSet, progress_map::LockoutInterval},
         replay_stage::DUPLICATE_THRESHOLD,
     },
     chrono::prelude::*,
+    index_map::IndexMap,
     solana_clock::{Slot, UnixTimestamp},
     solana_hash::Hash,
     solana_instruction::Instruction,
@@ -164,7 +166,7 @@ pub const SWITCH_FORK_THRESHOLD: f64 = 0.38;
 pub type Result<T> = std::result::Result<T, TowerError>;
 
 pub type Stake = u64;
-pub type VotedStakes = VecMap<Slot, Stake>;
+pub type VotedStakes = IndexMap<Slot, Stake>;
 pub type PubkeyVotes = Vec<(Pubkey, Slot)>;
 
 pub(crate) struct ComputedBankState {
@@ -410,6 +412,7 @@ impl Tower {
         ancestors: &HashMap<Slot, HashSet<Slot>>,
         get_frozen_hash: impl Fn(Slot) -> Option<Hash>,
         latest_validator_votes_for_frozen_banks: &mut LatestValidatorVotesForFrozenBanks,
+        vote_slots: &mut IndexSet<Slot>,
     ) -> ComputedBankState {
         let mut total_stake = 0;
 
@@ -420,8 +423,9 @@ impl Tower {
             .unwrap_or(bank_slot);
         let max_slot = bank_slot;
 
-        let mut vote_slots = VecSet::from_range(min_slot, max_slot);
-        let mut voted_stakes = VecMap::<Slot, Stake>::from_range(min_slot, max_slot);
+        vote_slots.reserve(min_slot..=max_slot);
+        let mut voted_stakes =
+            IndexMap::<Slot, Stake>::with_capacity_for_range(min_slot..=max_slot);
 
         let total_votes = vote_accounts
             .values()
@@ -448,7 +452,7 @@ impl Tower {
             let root_slot = view.root_slot();
 
             if key == *vote_account_pubkey {
-                my_latest_landed_vote = view.last_voted_slot();
+                my_latest_landed_vote = last_voted_slot;
                 debug!("vote state {view:?}");
                 debug!("observed slot {}", last_voted_slot.unwrap_or(0) as i64);
                 debug!("observed root {}", root_slot.unwrap_or(0) as i64);
@@ -552,7 +556,7 @@ impl Tower {
 
         // TODO: populate_ancestor_voted_stakes only adds zeros. Comment why
         // that is necessary (if so).
-        Self::populate_ancestor_voted_stakes(&mut voted_stakes, vote_slots, ancestors);
+        Self::populate_ancestor_voted_stakes(&mut voted_stakes, vote_slots.iter(), ancestors);
 
         // As commented above, since the votes at current bank_slot are
         // simulated votes, the voted_stake for `bank_slot` is not populated.
@@ -568,6 +572,8 @@ impl Tower {
                     .copied()
             })
             .unwrap_or(0);
+
+        vote_slots.clear();
 
         ComputedBankState {
             voted_stakes,
@@ -1437,9 +1443,18 @@ impl Tower {
         // this slot
         for vote_slot in vote_slots {
             if let Some(slot_ancestors) = ancestors.get(&vote_slot) {
-                voted_stakes.entry(vote_slot).get_or_insert_default();
-                for slot in slot_ancestors {
-                    voted_stakes.entry(*slot).get_or_insert_default();
+                let mut min = vote_slot;
+                let mut max = vote_slot;
+                for &slot in slot_ancestors {
+                    if slot < min {
+                        min = slot;
+                    }
+                    if slot > max {
+                        max = slot;
+                    }
+                }
+                for entry in voted_stakes.entries(min..=max) {
+                    entry.or_default();
                 }
             }
         }
@@ -1456,9 +1471,19 @@ impl Tower {
         // If there's no ancestors, that means this slot must be from
         // before the current root, so ignore this slot
         if let Some(vote_slot_ancestors) = ancestors.get(&voted_slot) {
-            *voted_stakes.entry(voted_slot).get_or_insert_default() += voted_stake;
-            for slot in vote_slot_ancestors {
-                *voted_stakes.entry(*slot).get_or_insert_default() += voted_stake;
+            let mut min = voted_slot;
+            let mut max = voted_slot;
+            for &slot in vote_slot_ancestors {
+                if slot < min {
+                    min = slot;
+                }
+                if slot > max {
+                    max = slot;
+                }
+            }
+
+            for entry in voted_stakes.entries(min..=max) {
+                *entry.or_default() += voted_stake;
             }
         }
     }
@@ -2544,6 +2569,7 @@ pub mod test {
             &ancestors,
             |_| Some(Hash::default()),
             &mut latest_validator_votes_for_frozen_banks,
+            &mut IndexSet::new(),
         );
         assert_eq!(voted_stakes[&0], 2);
         assert_eq!(total_stake, 2);
@@ -2591,6 +2617,7 @@ pub mod test {
             &ancestors,
             |_| Some(Hash::default()),
             &mut latest_validator_votes_for_frozen_banks,
+            &mut IndexSet::new(),
         );
         for i in 0..MAX_LOCKOUT_HISTORY {
             assert_eq!(voted_stakes[&(i as u64)], 2);
@@ -2616,7 +2643,7 @@ pub mod test {
     fn test_check_vote_threshold_no_skip_lockout_with_new_root() {
         agave_logger::setup();
         let mut tower = Tower::new_for_tests(4, 0.67);
-        let mut stakes = VecMap::from_range(0, MAX_LOCKOUT_HISTORY as u64);
+        let mut stakes = IndexMap::with_capacity_for_range(0..=MAX_LOCKOUT_HISTORY as u64);
         for i in 0..(MAX_LOCKOUT_HISTORY as u64 + 1) {
             stakes.insert(i, 1);
             tower.record_vote(i, Hash::default());
@@ -2636,7 +2663,7 @@ pub mod test {
     #[test]
     fn test_is_slot_confirmed_unknown_slot() {
         let tower = Tower::new_for_tests(1, 0.67);
-        let stakes = VecMap::new();
+        let stakes = IndexMap::new();
         assert!(!tower.is_slot_confirmed(0, &stakes, 2));
     }
 
@@ -2657,7 +2684,7 @@ pub mod test {
     #[test]
     fn test_is_slot_duplicate_confirmed_unknown_slot() {
         let tower = Tower::new_for_tests(1, 0.67);
-        let stakes = VecMap::new();
+        let stakes = IndexMap::new();
         assert!(!tower.is_slot_duplicate_confirmed(0, &stakes, 100));
     }
 
@@ -2828,7 +2855,7 @@ pub mod test {
     #[test]
     fn test_check_vote_threshold_above_threshold_no_stake() {
         let mut tower = Tower::new_for_tests(1, 0.67);
-        let stakes = VecMap::new();
+        let stakes = IndexMap::new();
         tower.record_vote(0, Hash::default());
         assert!(!tower.check_vote_stake_thresholds(1, &stakes, 2).is_empty());
     }
@@ -2846,7 +2873,7 @@ pub mod test {
 
     #[test]
     fn test_stake_is_updated_for_entire_branch() {
-        let mut voted_stakes = VecMap::from_range(2, 2);
+        let mut voted_stakes = IndexMap::new();
         let account = AccountSharedData::from(Account {
             lamports: 1,
             ..Account::default()
@@ -2883,6 +2910,7 @@ pub mod test {
 
         // Initialize tower
         let mut tower = Tower::new_for_tests(VOTE_THRESHOLD_DEPTH, threshold_size);
+        let mut vote_slots = IndexSet::new();
 
         // CASE 1: Record the first VOTE_THRESHOLD tower votes for fork 2. We want to
         // evaluate a vote on slot VOTE_THRESHOLD_DEPTH. The nth most recent vote should be
@@ -2903,6 +2931,7 @@ pub mod test {
             &ancestors,
             |_| None,
             &mut LatestValidatorVotesForFrozenBanks::default(),
+            &mut vote_slots,
         );
         assert!(tower
             .check_vote_stake_thresholds(vote_to_evaluate, &voted_stakes, total_stake)
@@ -2923,6 +2952,7 @@ pub mod test {
             &ancestors,
             |_| None,
             &mut LatestValidatorVotesForFrozenBanks::default(),
+            &mut vote_slots,
         );
         assert!(!tower
             .check_vote_stake_thresholds(vote_to_evaluate, &voted_stakes, total_stake)

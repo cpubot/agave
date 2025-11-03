@@ -127,7 +127,7 @@ impl VoteStateView {
             .and_then(|view| view.pubkey())
     }
 
-    pub fn votes_iter(&self) -> impl Iterator<Item = Lockout> + '_ {
+    pub fn votes_iter(&self) -> impl ExactSizeIterator<Item = Lockout> + '_ {
         self.votes_view().into_iter().map(|vote| {
             Lockout::new_with_confirmation_count(vote.slot(), vote.confirmation_count())
         })
