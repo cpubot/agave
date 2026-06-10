@@ -1,6 +1,6 @@
 use {
     crate::{
-        bit_vec::BitVec,
+        bit_vec::{BitVec, BitVecRef},
         blockstore::ParentInfo,
         shred::{
             self, DATA_SHREDS_PER_FEC_BLOCK, MAX_DATA_SHREDS_PER_SLOT, Shred, ShredType,
@@ -185,6 +185,20 @@ pub struct SlotMetaV3 {
 
 pub type SlotMeta = SlotMetaV3;
 
+/// Lighter-weight [`SlotMeta`] containing only fields used for repair operations.
+#[derive(Clone, Debug, Default, SchemaRead, Eq, PartialEq)]
+pub struct RepairSlotMeta {
+    pub slot: Slot,
+    pub consumed: u64,
+    pub received: u64,
+    pub first_shred_timestamp: u64,
+    #[wincode(with = "wincode_compat::OptionCompat")]
+    pub last_index: Option<u64>,
+    #[wincode(with = "wincode_compat::OptionCompat")]
+    pub parent_slot: Option<Slot>,
+    pub next_slots: Vec<Slot>,
+}
+
 // Wincode implementation of serialize and deserialize for Option<u64>
 // where None is represented as u64::MAX; for backward compatibility.
 mod wincode_compat {
@@ -275,6 +289,14 @@ pub struct Index {
     pub slot: Slot,
     data: ShredIndex,
     coding: ShredIndex,
+}
+
+/// Reference to [`Index`].
+#[derive(Clone, Debug, SchemaRead, PartialEq, Eq)]
+pub struct IndexRef<'a> {
+    pub slot: Slot,
+    data: ShredIndexRef<'a>,
+    coding: ShredIndexRef<'a>,
 }
 
 #[derive(Clone, Copy, Debug, SchemaRead, SchemaWrite, Eq, PartialEq)]
@@ -443,8 +465,19 @@ impl Index {
     pub(crate) fn data_mut(&mut self) -> &mut ShredIndex {
         &mut self.data
     }
+
     pub(crate) fn coding_mut(&mut self) -> &mut ShredIndex {
         &mut self.coding
+    }
+}
+
+impl IndexRef<'_> {
+    pub fn data(&self) -> &ShredIndexRef<'_> {
+        &self.data
+    }
+
+    pub fn coding(&self) -> &ShredIndexRef<'_> {
+        &self.coding
     }
 }
 
@@ -514,6 +547,60 @@ impl FromIterator<u64> for ShredIndex {
             index.insert(idx);
         }
         index
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, SchemaRead)]
+pub struct ShredIndexRef<'a> {
+    index: BitVecRef<'a, MAX_DATA_SHREDS_PER_SLOT>,
+    num_shreds: usize,
+}
+
+impl ShredIndexRef<'_> {
+    pub(crate) fn range<R>(&self, bounds: R) -> impl Iterator<Item = u64> + '_
+    where
+        R: RangeBounds<u64>,
+    {
+        let start = bounds.start_bound().map(|&b| b as usize);
+        let end = bounds.end_bound().map(|&b| b as usize);
+        self.index
+            .range((start, end))
+            .iter_ones()
+            .map(|idx| idx as u64)
+    }
+
+    #[inline]
+    pub fn num_shreds(&self) -> usize {
+        self.num_shreds
+    }
+}
+
+impl RepairSlotMeta {
+    pub fn is_full(&self) -> bool {
+        // last_index is None when it has no information about how
+        // many shreds will fill this slot.
+        // Note: A full slot with zero shreds is not possible.
+        // Should never happen
+        if self
+            .last_index
+            .map(|ix| self.consumed > ix + 1)
+            .unwrap_or_default()
+        {
+            datapoint_error!(
+                "blockstore_error",
+                (
+                    "error",
+                    format!(
+                        "Observed a slot meta with consumed: {} > meta.last_index + 1: {:?}",
+                        self.consumed,
+                        self.last_index.map(|ix| ix + 1),
+                    ),
+                    String
+                )
+            );
+        }
+
+        Some(self.consumed) == self.last_index.map(|ix| ix + 1)
     }
 }
 

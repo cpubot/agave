@@ -13,7 +13,8 @@ use {
     solana_epoch_schedule::EpochSchedule,
     solana_hash::Hash,
     solana_ledger::{
-        ancestor_iterator::AncestorIterator, blockstore::Blockstore, blockstore_meta::SlotMeta,
+        ancestor_iterator::AncestorIterator, blockstore::Blockstore,
+        blockstore_meta::RepairSlotMeta,
     },
     solana_measure::measure::Measure,
     solana_pubkey::Pubkey,
@@ -213,8 +214,9 @@ impl RepairWeight {
         outstanding_repairs: &mut HashMap<ShredRepairType, u64>,
     ) -> Vec<ShredRepairType> {
         let mut repairs = vec![];
-        let mut processed_slots = HashSet::from([self.root]);
-        let mut slot_meta_cache = HashMap::default();
+        let mut processed_slots = HashSet::with_hasher(ahash::RandomState::new());
+        processed_slots.insert(self.root);
+        let mut slot_meta_cache = HashMap::with_hasher(ahash::RandomState::new());
 
         let mut get_best_orphans_elapsed = Measure::start("get_best_orphans");
         // Find the best orphans in order from heaviest stake to least heavy
@@ -244,7 +246,7 @@ impl RepairWeight {
             outstanding_repairs,
         );
         let num_best_shreds_repairs = best_shreds_repairs.len();
-        let repair_slots_set: HashSet<Slot> =
+        let repair_slots_set: HashSet<Slot, ahash::RandomState> =
             best_shreds_repairs.iter().map(|r| r.slot()).collect();
         let num_best_shreds_slots = repair_slots_set.len();
         processed_slots.extend(repair_slots_set);
@@ -502,7 +504,7 @@ impl RepairWeight {
     fn get_best_shreds(
         &mut self,
         blockstore: &Blockstore,
-        slot_meta_cache: &mut HashMap<Slot, Option<SlotMeta>>,
+        slot_meta_cache: &mut HashMap<Slot, Option<RepairSlotMeta>, ahash::RandomState>,
         repairs: &mut Vec<ShredRepairType>,
         max_new_shreds: usize,
         repair_eligibility: &mut RepairEligibility,
@@ -523,7 +525,7 @@ impl RepairWeight {
     fn get_best_orphans(
         &mut self,
         blockstore: &Blockstore,
-        processed_slots: &mut HashSet<Slot>,
+        processed_slots: &mut HashSet<Slot, ahash::RandomState>,
         repairs: &mut Vec<ShredRepairType>,
         epoch_stakes: &HashMap<Epoch, VersionedEpochStakes>,
         epoch_schedule: &EpochSchedule,
@@ -600,8 +602,8 @@ impl RepairWeight {
     fn get_best_unknown_last_index(
         &mut self,
         blockstore: &Blockstore,
-        slot_meta_cache: &mut HashMap<Slot, Option<SlotMeta>>,
-        processed_slots: &mut HashSet<Slot>,
+        slot_meta_cache: &mut HashMap<Slot, Option<RepairSlotMeta>, ahash::RandomState>,
+        processed_slots: &mut HashSet<Slot, ahash::RandomState>,
         max_new_repairs: usize,
         outstanding_repairs: &mut HashMap<ShredRepairType, u64>,
     ) -> Vec<ShredRepairType> {
@@ -630,8 +632,8 @@ impl RepairWeight {
     fn get_best_closest_completion(
         &mut self,
         blockstore: &Blockstore,
-        slot_meta_cache: &mut HashMap<Slot, Option<SlotMeta>>,
-        processed_slots: &mut HashSet<Slot>,
+        slot_meta_cache: &mut HashMap<Slot, Option<RepairSlotMeta>, ahash::RandomState>,
+        processed_slots: &mut HashSet<Slot, ahash::RandomState>,
         max_new_repairs: usize,
         repair_eligibility: &mut RepairEligibility,
         outstanding_repairs: &mut HashMap<ShredRepairType, u64>,
@@ -1509,7 +1511,8 @@ mod test {
         // should prioritize smaller orphan first
         let mut repairs = vec![];
         let mut outstanding_repairs = HashMap::new();
-        let mut processed_slots: HashSet<Slot> = vec![repair_weight.root].into_iter().collect();
+        let mut processed_slots: HashSet<Slot, ahash::RandomState> =
+            vec![repair_weight.root].into_iter().collect();
         repair_weight.get_best_orphans(
             &blockstore,
             &mut processed_slots,
@@ -1662,7 +1665,8 @@ mod test {
         // exactly one more of the remaining two
         let mut repairs = vec![];
         let mut outstanding_repairs = HashMap::new();
-        let mut processed_slots: HashSet<Slot> = vec![repair_weight.root].into_iter().collect();
+        let mut processed_slots: HashSet<Slot, ahash::RandomState> =
+            vec![repair_weight.root].into_iter().collect();
         blockstore.add_tree(tr(100) / (tr(101)), true, true, 2, Hash::default());
         repair_weight.get_best_orphans(
             &blockstore,

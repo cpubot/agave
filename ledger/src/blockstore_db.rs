@@ -39,7 +39,11 @@ use {
             atomic::{AtomicU64, Ordering},
         },
     },
-    wincode::{SchemaReadOwned, deserialize},
+    wincode::{
+        SchemaRead, SchemaReadOwned,
+        config::{ConfigCore, DefaultConfig},
+        deserialize,
+    },
 };
 
 const BLOCKSTORE_METRICS_ERROR: i64 = -1;
@@ -566,6 +570,52 @@ impl WriteBatch {
     }
 }
 
+/// A pinned value decoded from a [`DBPinnableSlice`] using [`SchemaRead`].
+///
+/// Use this for zero-copy access to a value stored in the blockstore.
+pub struct PinnedT<'a, C: ConfigCore, T: SchemaRead<'a, C>> {
+    val: T::Dst,
+    _slice: DBPinnableSlice<'a>,
+    _phantom: PhantomData<C>,
+}
+
+impl<'a, C, T> std::ops::Deref for PinnedT<'a, C, T>
+where
+    C: ConfigCore,
+    T: SchemaRead<'a, C>,
+{
+    type Target = T::Dst;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.val
+    }
+}
+
+impl<'de, T, C> PinnedT<'de, C, T>
+where
+    C: ConfigCore,
+    T: SchemaRead<'de, C>,
+{
+    fn new(slice: DBPinnableSlice<'de>) -> Result<Self> {
+        // SAFETY: `DBPinnableSlice` keeps the RocksDB value pointer valid until it is
+        // dropped. `PinnedT` stores `val` before `_slice`, so `val` is dropped first;
+        // any references decoded into `val` cannot outlive the pinned bytes.
+        let val =
+            T::get(unsafe { std::slice::from_raw_parts(slice.as_ref().as_ptr(), slice.len()) })?;
+        Ok(Self {
+            val,
+            _slice: slice,
+            _phantom: PhantomData,
+        })
+    }
+
+    #[inline]
+    pub fn get(&self) -> &T::Dst {
+        &self.val
+    }
+}
+
 impl<C> LedgerColumn<C>
 where
     C: Column + ColumnName,
@@ -608,6 +658,16 @@ where
             );
         }
         result
+    }
+
+    pub fn get_pinned_t<'a, T>(
+        &'a self,
+        index: C::Index,
+    ) -> Result<Option<PinnedT<'a, DefaultConfig, T>>>
+    where
+        T: SchemaRead<'a, DefaultConfig>,
+    {
+        self.get_slice(index)?.map(PinnedT::new).transpose()
     }
 
     /// Create a key type suitable for use with multi_get_bytes() and

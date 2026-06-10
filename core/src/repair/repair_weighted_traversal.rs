@@ -8,7 +8,7 @@ use {
     },
     solana_clock::Slot,
     solana_hash::Hash,
-    solana_ledger::{blockstore::Blockstore, blockstore_meta::SlotMeta},
+    solana_ledger::{blockstore::Blockstore, blockstore_meta::RepairSlotMeta},
     std::collections::{HashMap, HashSet},
 };
 
@@ -79,7 +79,7 @@ impl Iterator for RepairWeightTraversal<'_> {
 pub fn get_best_repair_shreds(
     tree: &HeaviestSubtreeForkChoice,
     blockstore: &Blockstore,
-    slot_meta_cache: &mut HashMap<Slot, Option<SlotMeta>>,
+    slot_meta_cache: &mut HashMap<Slot, Option<RepairSlotMeta>, ahash::RandomState>,
     repairs: &mut Vec<ShredRepairType>,
     max_new_shreds: usize,
     repair_eligibility: &mut RepairEligibility,
@@ -90,54 +90,90 @@ pub fn get_best_repair_shreds(
     if repairs.len() >= max_repairs {
         return;
     }
-    let weighted_iter = RepairWeightTraversal::new(tree);
-    let mut visited_set = HashSet::new();
-    for next in weighted_iter {
-        if repairs.len() >= max_repairs {
+    const META_PREFETCH_CHUNK_SIZE: usize = 256;
+
+    let mut weighted_iter = RepairWeightTraversal::new(tree);
+    let mut chunk = Vec::with_capacity(META_PREFETCH_CHUNK_SIZE);
+    let mut uncached_slot_keys = Vec::with_capacity(META_PREFETCH_CHUNK_SIZE);
+    let mut visited_set = HashSet::with_hasher(ahash::RandomState::new());
+
+    while repairs.len() < max_repairs {
+        let chunk_size = META_PREFETCH_CHUNK_SIZE.min(max_repairs - repairs.len());
+        chunk.clear();
+        chunk.extend(weighted_iter.by_ref().take(chunk_size));
+        if chunk.is_empty() {
             break;
         }
 
-        let slot_meta = slot_meta_cache
-            .entry(next.slot())
-            .or_insert_with(|| blockstore.meta(next.slot()).unwrap());
+        uncached_slot_keys.clear();
+        uncached_slot_keys.extend(chunk.iter().filter_map(|next| {
+            let Visit::Unvisited(slot) = next else {
+                return None;
+            };
+            if !slot_meta_cache.contains_key(slot) {
+                Some(Blockstore::slot_meta_key(*slot))
+            } else {
+                None
+            }
+        }));
 
-        // May not exist if blockstore purged the SlotMeta due to something
-        // like duplicate slots. TODO: Account for duplicate slot may be in orphans, especially
-        // if earlier duplicate was already removed
-        if let Some(slot_meta) = slot_meta {
-            match next {
-                Visit::Unvisited(slot) => {
-                    let new_repairs = RepairService::generate_repairs_for_slot(
-                        blockstore,
-                        slot,
-                        slot_meta,
-                        repair_eligibility,
-                        max_repairs - repairs.len(),
-                        outstanding_repairs,
-                    );
-                    repairs.extend(new_repairs);
-                    visited_set.insert(slot);
-                }
-                Visit::Visited(_) => {
-                    // By the time we reach here, this means all the children of this slot
-                    // have been explored/repaired. Although this slot has already been visited,
-                    // this slot is still the heaviest slot left in the traversal. Thus any
-                    // remaining children that have not been explored should now be repaired.
-                    for new_child_slot in &slot_meta.next_slots {
-                        // If the `new_child_slot` has not been visited by now, it must
-                        // not exist in `tree`
-                        if !visited_set.contains(new_child_slot) {
-                            // Generate repairs for entire subtree rooted at `new_child_slot`
-                            RepairService::generate_repairs_for_fork(
-                                blockstore,
-                                repairs,
-                                max_repairs,
-                                *new_child_slot,
-                                repair_eligibility,
-                                outstanding_repairs,
-                            );
+        slot_meta_cache.extend(
+            uncached_slot_keys
+                .iter()
+                .copied()
+                .map(Slot::from_be_bytes)
+                .zip(
+                    blockstore
+                        .meta_repair_multi(&uncached_slot_keys)
+                        .map(Result::unwrap),
+                ),
+        );
+
+        for next in chunk.drain(..) {
+            if repairs.len() >= max_repairs {
+                break;
+            }
+
+            let slot_meta = slot_meta_cache.get(&next.slot()).unwrap();
+
+            // May not exist if blockstore purged the SlotMeta due to something
+            // like duplicate slots. TODO: Account for duplicate slot may be in orphans, especially
+            // if earlier duplicate was already removed
+            if let Some(slot_meta) = slot_meta {
+                match next {
+                    Visit::Unvisited(slot) => {
+                        let new_repairs = RepairService::generate_repairs_for_slot(
+                            blockstore,
+                            slot,
+                            slot_meta,
+                            repair_eligibility,
+                            max_repairs - repairs.len(),
+                            outstanding_repairs,
+                        );
+                        repairs.extend(new_repairs);
+                        visited_set.insert(slot);
+                    }
+                    Visit::Visited(_) => {
+                        // By the time we reach here, this means all the children of this slot
+                        // have been explored/repaired. Although this slot has already been visited,
+                        // this slot is still the heaviest slot left in the traversal. Thus any
+                        // remaining children that have not been explored should now be repaired.
+                        for &new_child_slot in &slot_meta.next_slots {
+                            // If the `new_child_slot` has not been visited by now, it must
+                            // not exist in `tree`
+                            if !visited_set.contains(&new_child_slot) {
+                                // Generate repairs for entire subtree rooted at `new_child_slot`
+                                RepairService::generate_repairs_for_fork(
+                                    blockstore,
+                                    repairs,
+                                    max_repairs,
+                                    new_child_slot,
+                                    repair_eligibility,
+                                    outstanding_repairs,
+                                );
+                            }
+                            visited_set.insert(new_child_slot);
                         }
-                        visited_set.insert(*new_child_slot);
                     }
                 }
             }

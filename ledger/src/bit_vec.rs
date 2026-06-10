@@ -30,6 +30,136 @@ pub struct BitVec<const NUM_BITS: usize> {
     words: Box<[Word]>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BitVecRef<'a, const NUM_BITS: usize> {
+    words: &'a [Word],
+}
+
+#[inline]
+fn location_of(idx: usize) -> (usize, usize) {
+    let word_idx = idx / BITS_PER_WORD;
+    let bit_idx = idx & (BITS_PER_WORD - 1);
+    (word_idx, bit_idx)
+}
+
+#[inline]
+fn check_bounds<const NUM_BITS: usize>(idx: usize) -> Result<(), BitVecError> {
+    if idx >= NUM_BITS {
+        return Err(BitVecError::OutOfBounds {
+            index: idx,
+            num_bits: NUM_BITS,
+        });
+    }
+    Ok(())
+}
+
+#[inline]
+fn contains<const NUM_BITS: usize>(words: &[Word], idx: usize) -> bool {
+    if check_bounds::<NUM_BITS>(idx).is_err() {
+        return false;
+    }
+
+    let (word_idx, bit_idx) = location_of(idx);
+    (words[word_idx] & (1 << bit_idx)) != 0
+}
+
+impl<'a, const NUM_BITS: usize> BitVecRef<'a, NUM_BITS> {
+    const NUM_WORDS: usize = NUM_BITS.div_ceil(BITS_PER_WORD);
+
+    /// Get the word and bit offset for the given index.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use solana_ledger::bit_vec::BitVec;
+    /// let (word_idx, bit_idx) = BitVec::<64>::location_of(63);
+    /// assert_eq!(word_idx, 7);
+    /// assert_eq!(bit_idx, 7);
+    /// ```
+    #[inline]
+    pub fn location_of(idx: usize) -> (usize, usize) {
+        location_of(idx)
+    }
+
+    /// Check if a bit is set at the given index.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use solana_ledger::bit_vec::BitVec;
+    /// let mut bit_vec = BitVec::<64>::default();
+    /// bit_vec.insert(63);
+    /// assert!(bit_vec.contains(63));
+    /// ```
+    #[inline]
+    pub fn contains(&self, idx: usize) -> bool {
+        contains::<NUM_BITS>(self.words, idx)
+    }
+
+    /// Get an iterator over the bits in the array within the given range.
+    ///
+    /// See [`BitVecSlice::from_range_bounds`] for more information.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use solana_ledger::bit_vec::BitVec;
+    ///
+    /// let mut bit_vec = BitVec::<64>::default();
+    /// bit_vec.insert(0);
+    /// bit_vec.insert(1);
+    /// assert_eq!(bit_vec.range(..2).iter_ones().collect::<Vec<_>>(), [0, 1]);
+    /// assert_eq!(bit_vec.range(1..).count_ones(), 1);
+    /// ```
+    #[inline]
+    pub fn range(&self, bounds: impl RangeBounds<usize>) -> BitVecSlice<'_, NUM_BITS> {
+        BitVecSlice::from_range_bounds(self.words, bounds)
+    }
+
+    /// Get an iterator over the positions of the set bits in the array.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use solana_ledger::bit_vec::BitVec;
+    /// let mut bit_vec = BitVec::<64>::default();
+    /// bit_vec.insert(0);
+    /// bit_vec.insert(1);
+    /// assert_eq!(bit_vec.iter_ones().collect::<Vec<_>>(), [0, 1]);
+    /// ```
+    pub fn iter_ones(&self) -> impl DoubleEndedIterator<Item = usize> + '_ {
+        self.range(..NUM_BITS).iter_ones()
+    }
+
+    /// Count the number of set bits in the array.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use solana_ledger::bit_vec::BitVec;
+    /// let mut bit_vec = BitVec::<64>::default();
+    /// bit_vec.insert(0);
+    /// bit_vec.insert(1);
+    /// assert_eq!(bit_vec.count_ones(), 2);
+    /// ```
+    pub fn count_ones(&self) -> usize {
+        self.range(..NUM_BITS).count_ones()
+    }
+
+    /// Shorthand for checking if there are no set bits in the array.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use solana_ledger::bit_vec::BitVec;
+    /// let mut bit_vec = BitVec::<64>::default();
+    /// assert!(bit_vec.is_empty());
+    /// ```
+    pub fn is_empty(&self) -> bool {
+        self.count_ones() == 0
+    }
+}
+
 impl<const NUM_BITS: usize> Default for BitVec<NUM_BITS> {
     fn default() -> Self {
         Self {
@@ -59,6 +189,22 @@ unsafe impl<'de, const NUM_BITS: usize, C: Config> SchemaRead<'de, C> for BitVec
     }
 }
 
+unsafe impl<'de, const NUM_BITS: usize, C: Config> SchemaRead<'de, C> for BitVecRef<'de, NUM_BITS> {
+    type Dst = Self;
+
+    #[inline]
+    fn read(reader: impl Reader<'de>, dst: &mut MaybeUninit<Self::Dst>) -> ReadResult<()> {
+        use wincode::ReadError;
+
+        let words = <&'de [Word] as SchemaRead<C>>::get(reader)?;
+        if words.len() != Self::NUM_WORDS {
+            return Err(ReadError::Custom("Invalid BitVec length"));
+        }
+        dst.write(Self { words });
+        Ok(())
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum BitVecError {
     #[error("index out of bounds: {index} >= {num_bits}")]
@@ -78,20 +224,14 @@ impl<const NUM_BITS: usize> BitVec<NUM_BITS> {
     /// assert_eq!(word_idx, 7);
     /// assert_eq!(bit_idx, 7);
     /// ```
+    #[inline]
     pub fn location_of(idx: usize) -> (usize, usize) {
-        let word_idx = idx / BITS_PER_WORD;
-        let bit_idx = idx & (BITS_PER_WORD - 1);
-        (word_idx, bit_idx)
+        location_of(idx)
     }
 
+    #[inline]
     fn check_bounds(&self, idx: usize) -> Result<(), BitVecError> {
-        if idx >= NUM_BITS {
-            return Err(BitVecError::OutOfBounds {
-                index: idx,
-                num_bits: NUM_BITS,
-            });
-        }
-        Ok(())
+        check_bounds::<NUM_BITS>(idx)
     }
 
     /// Remove a bit at the given index.
@@ -228,13 +368,9 @@ impl<const NUM_BITS: usize> BitVec<NUM_BITS> {
     /// bit_vec.insert(63);
     /// assert!(bit_vec.contains(63));
     /// ```
+    #[inline]
     pub fn contains(&self, idx: usize) -> bool {
-        if self.check_bounds(idx).is_err() {
-            return false;
-        }
-
-        let (word_idx, bit_idx) = Self::location_of(idx);
-        (self.words[word_idx] & (1 << bit_idx)) != 0
+        contains::<NUM_BITS>(&self.words, idx)
     }
 
     /// Get an iterator over the bits in the array within the given range.
@@ -253,7 +389,7 @@ impl<const NUM_BITS: usize> BitVec<NUM_BITS> {
     /// assert_eq!(bit_vec.range(1..).count_ones(), 1);
     /// ```
     pub fn range(&self, bounds: impl RangeBounds<usize>) -> BitVecSlice<'_, NUM_BITS> {
-        BitVecSlice::from_range_bounds(self, bounds)
+        BitVecSlice::from_range_bounds(&self.words, bounds)
     }
 
     /// Get an iterator over the positions of the set bits in the array.
@@ -319,7 +455,7 @@ impl<'a, const NUM_BITS: usize> BitVecSlice<'a, NUM_BITS> {
     /// Construct a new [`BitVecSlice`] from a [`BitVec`] and a range.
     ///
     /// Internal function -- use [`BitVec::range`].
-    fn from_range_bounds(bit_vec: &'a BitVec<NUM_BITS>, bounds: impl RangeBounds<usize>) -> Self {
+    fn from_range_bounds(bit_vec: &'a [u8], bounds: impl RangeBounds<usize>) -> Self {
         let start = match bounds.start_bound() {
             Bound::Included(&n) => n,
             Bound::Excluded(&n) => n + 1,
@@ -340,7 +476,7 @@ impl<'a, const NUM_BITS: usize> BitVecSlice<'a, NUM_BITS> {
                 start,
                 end,
                 start_word,
-                iter: bit_vec.words[start_word..end_word].iter().enumerate(),
+                iter: bit_vec[start_word..end_word].iter().enumerate(),
             },
         }
     }
