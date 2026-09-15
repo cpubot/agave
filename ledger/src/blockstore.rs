@@ -1592,6 +1592,27 @@ impl Blockstore {
         false
     }
 
+    /// Checks whether all data shreds in a fixed-size FEC set are committed.
+    /// Used to skip queued recovery work completed by an earlier task or by
+    /// incoming shreds. This is an advisory check; blockstore can change after
+    /// the read, so recovered insertion must still validate current state.
+    pub fn is_erasure_set_complete<'db>(
+        &'db self,
+        erasure_set: ErasureSetId,
+        pinnable_slice: &mut DBPinnableSlice<'db>,
+    ) -> Result<bool> {
+        let (slot, fec_set_index) = erasure_set.store_key();
+        let start = u64::from(fec_set_index);
+        let end = start + DATA_SHREDS_PER_FEC_BLOCK as u64;
+        let result = self.get_index_ref_into(slot, pinnable_slice).map(|index| {
+            index.is_some_and(|index| {
+                index.data().count_range(start..end) == DATA_SHREDS_PER_FEC_BLOCK
+            })
+        });
+        pinnable_slice.reset();
+        result
+    }
+
     /// Attempts to recover the missing shreds described by `task` into
     /// `recovered_batch`.
     ///
@@ -4117,6 +4138,20 @@ impl Blockstore {
         slot: Slot,
     ) -> Result<Option<DBPinnedT<'_, DefaultConfig, IndexRef<'_>>>> {
         self.index_cf.get_pinned_t(slot)
+    }
+
+    /// Returns an [`IndexRef`] borrowing from the caller's reusable pinnable slice.
+    /// The slice can be reset or reused once the returned reference is released.
+    fn get_index_ref_into<'a, 'db>(
+        &'db self,
+        slot: Slot,
+        pinnable_slice: &'a mut DBPinnableSlice<'db>,
+    ) -> Result<Option<IndexRef<'a>>> {
+        if !self.index_cf.get_slice_into(slot, pinnable_slice)? {
+            return Ok(None);
+        }
+        let bytes = (*pinnable_slice).as_ref();
+        Ok(Some(wincode::deserialize(bytes)?))
     }
 
     fn get_index_from_location(
