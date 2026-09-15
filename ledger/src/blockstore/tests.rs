@@ -396,7 +396,8 @@ fn test_multi_get() {
     let keys = blockstore
         .meta_cf
         .multi_get_keys(0..TEST_PUT_ENTRY_COUNT as Slot);
-    let values = blockstore.meta_cf.multi_get(&keys);
+    let mut batch = blockstore.new_pinnable_slice_batch();
+    let values = blockstore.meta_cf.multi_get(&keys, &mut batch);
     for (i, value) in values.enumerate().take(TEST_PUT_ENTRY_COUNT) {
         let k = u64::try_from(i).unwrap();
         assert_eq!(
@@ -1358,6 +1359,42 @@ fn test_get_slots_since() {
             .into_iter()
             .collect();
     assert_eq!(blockstore.get_slots_since(&[0, 1, 3]).unwrap(), expected);
+}
+
+#[test]
+fn test_get_slots_since_with_batch() {
+    let ledger_path = get_tmp_ledger_path_auto_delete!();
+    let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+    let mut batch = blockstore.new_pinnable_slice_batch();
+    for slot in 0..20 {
+        let mut meta = SlotMeta::new(slot, Some(slot.saturating_sub(1)));
+        meta.next_slots.push(slot + 1);
+        blockstore.meta_cf.put(slot, &meta).unwrap();
+    }
+    for slots in [vec![3, 0, 99, 3], (0..20).collect(), vec![0], vec![]] {
+        assert_eq!(
+            blockstore
+                .get_slots_since_with_batch(&slots, &mut batch)
+                .unwrap(),
+            blockstore.get_slots_since(&slots).unwrap(),
+        );
+    }
+    let capacity = batch.capacity();
+    // Deserialization failure drops unread results as well; the batch remains reusable.
+    blockstore.meta_cf.put_bytes(0, b"invalid").unwrap();
+    assert!(
+        blockstore
+            .get_slots_since_with_batch(&[0, 1], &mut batch)
+            .is_err()
+    );
+    let mut meta = SlotMeta::new(0, Some(0));
+    meta.next_slots.push(42);
+    blockstore.meta_cf.put(0, &meta).unwrap();
+    let result = blockstore
+        .get_slots_since_with_batch(&[0], &mut batch)
+        .unwrap();
+    assert_eq!(result[&0], meta.next_slots);
+    assert_eq!(batch.capacity(), capacity);
 }
 
 #[test]

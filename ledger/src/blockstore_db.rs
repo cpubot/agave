@@ -1,4 +1,4 @@
-pub use rocksdb::{DBPinnableSlice, Direction as IteratorDirection};
+pub use rocksdb::{DBPinnableSlice, DBPinnableSliceBatch, Direction as IteratorDirection};
 use {
     crate::{
         blockstore::{
@@ -20,7 +20,7 @@ use {
     prost::Message,
     rocksdb::{
         self, ColumnFamily, ColumnFamilyDescriptor, CompactionDecision, DB, DBCompressionType,
-        DBIterator, IteratorMode as RocksIteratorMode, LiveFile, Options,
+        DBIterator, DBPinnableSliceRef, IteratorMode as RocksIteratorMode, LiveFile, Options,
         WriteBatch as RWriteBatch,
         compaction_filter::CompactionFilter,
         compaction_filter_factory::{CompactionFilterContext, CompactionFilterFactory},
@@ -359,6 +359,10 @@ impl Rocks {
         self.db.new_pinnable_slice()
     }
 
+    pub(crate) fn new_pinnable_slice_batch(&self) -> DBPinnableSliceBatch<'_> {
+        self.db.new_pinnable_slice_batch()
+    }
+
     fn get_pinned_cf_into<'db>(
         &'db self,
         cf: &ColumnFamily,
@@ -385,6 +389,21 @@ impl Rocks {
         self.db
             .batched_multi_get_cf(cf, keys, /*sorted_input:*/ false)
             .into_iter()
+            .map(|out| out.map_err(BlockstoreError::RocksDb))
+    }
+
+    fn multi_get_cf_into<'db, 'batch, 'key, K, I>(
+        &'db self,
+        cf: &ColumnFamily,
+        keys: I,
+        batch: &'batch mut DBPinnableSliceBatch<'db>,
+    ) -> impl Iterator<Item = Result<Option<DBPinnableSliceRef<'batch, 'db>>>> + use<'db, 'batch, K, I>
+    where
+        K: AsRef<[u8]> + 'key + ?Sized,
+        I: IntoIterator<Item = &'key K>,
+    {
+        self.db
+            .batched_multi_get_cf_into(cf, keys, /*sorted_input:*/ false, batch)
             .map(|out| out.map_err(BlockstoreError::RocksDb))
     }
 
@@ -905,12 +924,13 @@ impl<C> LedgerColumn<C>
 where
     C: TypedColumn + ColumnName,
 {
-    pub(crate) fn multi_get<'a, K>(
-        &'a self,
-        keys: impl IntoIterator<Item = &'a K> + 'a,
-    ) -> impl Iterator<Item = Result<Option<C::Type>>> + 'a
+    pub(crate) fn multi_get<'db, 'batch, 'key, K>(
+        &'db self,
+        keys: impl IntoIterator<Item = &'key K>,
+        batch: &'batch mut DBPinnableSliceBatch<'db>,
+    ) -> impl Iterator<Item = Result<Option<C::Type>>>
     where
-        K: AsRef<[u8]> + 'a + ?Sized,
+        K: AsRef<[u8]> + 'key + ?Sized,
     {
         let is_perf_enabled = maybe_enable_rocksdb_perf(
             self.column_options.rocks_perf_sample_interval,
@@ -919,7 +939,7 @@ where
 
         let result = self
             .backend
-            .multi_get_cf(self.handle(), keys)
+            .multi_get_cf_into(self.handle(), keys, batch)
             .map(|out| out?.as_deref().map(C::deserialize).transpose());
 
         if let Some(op_start_instant) = is_perf_enabled {

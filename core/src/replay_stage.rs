@@ -60,6 +60,7 @@ use {
     solana_leader_schedule::{NUM_CONSECUTIVE_LEADER_SLOTS, SlotLeader},
     solana_ledger::{
         blockstore::{Blockstore, BlockstoreError, UpdateParentReceiver},
+        blockstore_db::DBPinnableSliceBatch,
         blockstore_meta::BlockLocation,
         blockstore_processor::{
             self, AsyncVerificationProgress, BlockstoreProcessorError, ChainedBlockIdCheck,
@@ -314,9 +315,9 @@ impl ProcessActiveBanksContext {
 }
 
 /// Borrowed inputs that do not change while discovering new replay banks.
-struct NewBankForksContext<'a> {
+struct NewBankForksContext<'a, 'db> {
     /// Ledger data and SlotMeta used to discover children of frozen banks.
-    blockstore: &'a Blockstore,
+    blockstore: &'db Blockstore,
     /// Fork graph where new banks are inserted after discovery.
     bank_forks: &'a RwLock<BankForks>,
     /// Leader schedule used to construct child banks.
@@ -932,6 +933,7 @@ impl ReplayStage {
                 leader_schedule_cache: leader_schedule_cache.clone(),
             };
 
+            let mut slot_meta_batch = blockstore.new_pinnable_slice_batch();
             let poh_shared_leader_state = poh_recorder.read().unwrap().shared_leader_state();
             if !migration_status.is_alpenglow_enabled() {
                 // This reset is handled in block creation loop for alpenglow
@@ -991,6 +993,7 @@ impl ReplayStage {
                     },
                     &mut progress,
                     &mut replay_timing,
+                    &mut slot_meta_batch,
                 );
                 generate_new_bank_forks_time.stop();
 
@@ -5303,10 +5306,11 @@ impl ReplayStage {
         }
     }
 
-    fn generate_new_bank_forks(
-        ctx: NewBankForksContext<'_>,
+    fn generate_new_bank_forks<'db>(
+        ctx: NewBankForksContext<'_, 'db>,
         progress: &mut ProgressMap,
         replay_timing: &mut ReplayLoopTiming,
+        slot_meta_batch: &mut DBPinnableSliceBatch<'db>,
     ) {
         let NewBankForksContext {
             blockstore,
@@ -5346,7 +5350,7 @@ impl ReplayStage {
         let mut generate_new_bank_forks_get_slots_since =
             Measure::start("generate_new_bank_forks_get_slots_since");
         let next_slots = blockstore
-            .get_slots_since(&frozen_bank_slots)
+            .get_slots_since_with_batch(&frozen_bank_slots, slot_meta_batch)
             .expect("Db error");
         generate_new_bank_forks_get_slots_since.stop();
 

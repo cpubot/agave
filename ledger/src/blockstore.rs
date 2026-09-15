@@ -9,8 +9,8 @@ use {
         ancestor_iterator::AncestorIterator,
         blockstore::column::{TypedColumn, columns as cf},
         blockstore_db::{
-            DBPinnableSlice, DBPinnedT, IteratorDirection, IteratorMode, LedgerColumn, Rocks,
-            WriteBatch,
+            DBPinnableSlice, DBPinnableSliceBatch, DBPinnedT, IteratorDirection, IteratorMode,
+            LedgerColumn, Rocks, WriteBatch,
         },
         blockstore_meta::*,
         blockstore_options::{
@@ -895,6 +895,11 @@ impl Blockstore {
     /// Creates an empty pinnable slice for reuse by pinned get operations.
     pub fn new_pinnable_slice(&self) -> DBPinnableSlice<'_> {
         self.db.new_pinnable_slice()
+    }
+
+    /// Creates persistent MultiGet storage that grows on demand and retains capacity.
+    pub fn new_pinnable_slice_batch(&self) -> DBPinnableSliceBatch<'_> {
+        self.db.new_pinnable_slice_batch()
     }
 
     /// Returns the [`SlotMetaRepair`] of the specified slot.
@@ -5300,8 +5305,17 @@ impl Blockstore {
     /// Returns a mapping from each elements of `slots` to a list of the
     /// element's children slots.
     pub fn get_slots_since(&self, slots: &[Slot]) -> Result<HashMap<Slot, NextSlots>> {
+        self.get_slots_since_with_batch(slots, &mut self.new_pinnable_slice_batch())
+    }
+
+    /// Like [`Self::get_slots_since`], reusing MultiGet storage across calls.
+    pub fn get_slots_since_with_batch<'db>(
+        &'db self,
+        slots: &[Slot],
+        batch: &mut DBPinnableSliceBatch<'db>,
+    ) -> Result<HashMap<Slot, NextSlots>> {
         let keys = self.meta_cf.multi_get_keys(slots.iter().copied());
-        let slot_metas = self.meta_cf.multi_get(&keys);
+        let slot_metas = self.meta_cf.multi_get(&keys, batch);
 
         let mut slots_since: HashMap<Slot, _> = HashMap::with_capacity(slots.len());
         for meta in slot_metas.into_iter() {

@@ -477,6 +477,7 @@ fn test_child_slots_of_same_parent() {
         },
         &mut progress,
         &mut replay_timing,
+        &mut blockstore.new_pinnable_slice_batch(),
     );
     assert!(
         bank_forks
@@ -509,6 +510,7 @@ fn test_child_slots_of_same_parent() {
         },
         &mut progress,
         &mut replay_timing,
+        &mut blockstore.new_pinnable_slice_batch(),
     );
     assert!(
         bank_forks
@@ -3073,6 +3075,7 @@ fn test_purge_unconfirmed_duplicate_slots_and_reattach() {
         },
         &mut progress,
         &mut replay_timing,
+        &mut blockstore.new_pinnable_slice_batch(),
     );
     assert_eq!(bank_forks.read().unwrap().active_bank_slots(), vec![3]);
 
@@ -3106,6 +3109,7 @@ fn test_purge_unconfirmed_duplicate_slots_and_reattach() {
         },
         &mut progress,
         &mut replay_timing,
+        &mut blockstore.new_pinnable_slice_batch(),
     );
     assert_eq!(bank_forks.read().unwrap().active_bank_slots(), vec![5]);
 
@@ -3140,6 +3144,7 @@ fn test_purge_unconfirmed_duplicate_slots_and_reattach() {
         },
         &mut progress,
         &mut replay_timing,
+        &mut blockstore.new_pinnable_slice_batch(),
     );
     assert_eq!(bank_forks.read().unwrap().active_bank_slots(), vec![6]);
 
@@ -3173,6 +3178,7 @@ fn test_purge_unconfirmed_duplicate_slots_and_reattach() {
         },
         &mut progress,
         &mut replay_timing,
+        &mut blockstore.new_pinnable_slice_batch(),
     );
     assert_eq!(bank_forks.read().unwrap().active_bank_slots(), vec![7]);
 }
@@ -3327,6 +3333,7 @@ fn test_headerless_update_parent() {
         },
         &mut progress,
         &mut replay_timing,
+        &mut blockstore.new_pinnable_slice_batch(),
     );
 
     assert!(
@@ -3975,6 +3982,7 @@ fn test_replay_own_update_full() {
         },
         &mut progress,
         &mut replay_timing,
+        &mut blockstore.new_pinnable_slice_batch(),
     );
 
     let bank = bank_forks.read().unwrap().get(slot).unwrap();
