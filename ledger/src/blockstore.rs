@@ -395,6 +395,13 @@ impl RecoveredShredBatch {
             data_shreds: Vec::with_capacity(DATA_SHREDS_PER_FEC_BLOCK),
         }
     }
+
+    /// Releases recovered payloads and validation state, retaining buffer capacity for reuse.
+    pub fn clear(&mut self) {
+        self.validated_merkle_root_meta = None;
+        self.retransmit_shreds.clear();
+        self.data_shreds.clear();
+    }
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -1631,9 +1638,7 @@ impl Blockstore {
             stored_shred_ids,
         } = task;
         recovered_batch.erasure_set = erasure_set;
-        recovered_batch.validated_merkle_root_meta = None;
-        recovered_batch.retransmit_shreds.clear();
-        recovered_batch.data_shreds.clear();
+        recovered_batch.clear();
         let (slot, fec_set_index) = erasure_set.store_key();
         let stored_shreds = stored_shred_ids.into_iter().filter_map(|shred_id| {
             let bytes = match shred_id.shred_type() {
