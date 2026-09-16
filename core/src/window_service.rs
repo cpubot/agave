@@ -592,7 +592,7 @@ impl WindowService {
 
                 while !exit.load(Ordering::Relaxed) {
                     shred_recovery_context.maybe_update(sharable_banks.root());
-                    if let Err(e) = run_recovery(
+                    let result = run_recovery(
                         &recovery_receiver,
                         &blockstore,
                         &mut shred_recovery_context,
@@ -603,7 +603,12 @@ impl WindowService {
                         &mut metrics,
                         &mut recovery_metrics,
                         completed_data_sets_sender.as_ref(),
-                    ) && Self::should_exit_on_error(e)
+                    );
+                    for batch in &mut recovered_batch_scratch {
+                        batch.clear();
+                    }
+                    if let Err(e) = result
+                        && Self::should_exit_on_error(e)
                     {
                         break;
                     }
