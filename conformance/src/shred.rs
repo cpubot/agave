@@ -168,7 +168,7 @@ pub fn execute_shred_parse(ctx: &ShredParseContext) -> ShredParseEffects {
         }
     };
     let (retransmit_sender, _retransmit_rx) = EvictingSender::<Vec<Payload>>::new_bounded(0);
-    let mut recovery = ShredRecoveryContext::new(retransmit_sender, bank.clone(), shred_version);
+    let mut recovery = ShredRecoveryContext::new(bank.clone(), shred_version);
     let mut metrics = BlockstoreInsertionMetrics::default();
     let handle_duplicate = |duplicate: PossibleDuplicateShred| {
         let _duplicate_proof =
@@ -184,9 +184,10 @@ pub fn execute_shred_parse(ctx: &ShredParseContext) -> ShredParseEffects {
                 BlockLocation::Original,
             )
         });
-        if let Ok((_, tasks)) = blockstore.insert_shreds_at_location_prepare_recovery(
+        if let Ok((_, tasks)) = blockstore.insert_shreds_with_recovered(
             shreds_iter,
-            false, // is_trusted: keep dedup + integrity checks
+            &mut [],
+            &retransmit_sender,
             &mut pinnable_slice,
             &mut write_batch,
             &handle_duplicate,
@@ -203,9 +204,10 @@ pub fn execute_shred_parse(ctx: &ShredParseContext) -> ShredParseEffects {
                 })
                 .collect();
             if !recovered_batches.is_empty() {
-                let _ = blockstore.insert_recovered_shreds(
+                let _ = blockstore.insert_shreds_with_recovered(
+                    std::iter::empty(),
                     &mut recovered_batches,
-                    &recovery,
+                    &retransmit_sender,
                     &mut pinnable_slice,
                     &mut write_batch,
                     &handle_duplicate,
