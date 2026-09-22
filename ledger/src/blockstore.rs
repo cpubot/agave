@@ -64,6 +64,7 @@ use {
     solana_sha256_hasher::hashv,
     solana_signature::Signature,
     solana_signer::Signer,
+    solana_streamer::{evicting_sender::EvictingSender, streamer::ChannelSend},
     solana_svm_transaction::svm_message::SVMMessage,
     solana_time_utils::timestamp,
     solana_transaction::{TransactionVerificationMode, versioned::VersionedTransaction},
@@ -348,10 +349,11 @@ pub struct InsertResults {
 enum ShredRecoveryMode<'a> {
     /// Insert shreds without preparing or inserting recovery work.
     Disabled,
-    /// Return recovery tasks for FEC sets made recoverable by this insertion.
-    CollectTasks,
-    /// Insert previously reconstructed shreds without scheduling more recovery.
-    InsertRecovered(&'a mut [RecoveredShredBatch]),
+    /// Insert reconstructed shreds and collect recovery tasks for incoming shreds.
+    Enabled {
+        batches: &'a mut [RecoveredShredBatch],
+        retransmit_sender: &'a EvictingSender<Vec<Payload>>,
+    },
 }
 
 /// Inputs for recovering one FEC set, captured from the insertion working set.
@@ -420,7 +422,7 @@ pub struct VersionedConfirmedBlockWithComponents {
 ///
 /// Services such as the `WindowService` for a TVU, and `ReplayStage` for a TPU, piece together
 /// these sets by inserting shreds via direct or indirect calls to
-/// [`Blockstore::insert_shreds_at_location_prepare_recovery()`].
+/// [`Blockstore::insert_shreds_with_recovered()`].
 ///
 /// `solana_core::completed_data_sets_service::CompletedDataSetsService` is the main receiver of
 /// `CompletedDataSetInfo`.
@@ -2361,11 +2363,48 @@ impl Blockstore {
         metrics: &mut BlockstoreInsertionMetrics,
     ) -> Result<InsertResults> {
         let shreds = shreds.into_iter();
-        let (collect_recovery_tasks, recovered_batches): (_, &mut [_]) = match recovery_mode {
-            ShredRecoveryMode::Disabled => (false, &mut []),
-            ShredRecoveryMode::CollectTasks => (true, &mut []),
-            ShredRecoveryMode::InsertRecovered(recovered_batches) => (false, recovered_batches),
-        };
+        let (collect_recovery_tasks, recovered_batches, retransmit_sender): (_, &mut [_], _) =
+            match recovery_mode {
+                ShredRecoveryMode::Disabled => (false, &mut [], None),
+                ShredRecoveryMode::Enabled {
+                    batches,
+                    retransmit_sender,
+                } => (true, batches, Some(retransmit_sender)),
+            };
+        // Blockstore may have switched blocks since recovery started.
+        // Under the insertion lock, discard recovered batches whose Merkle root
+        // no longer matches blockstore before inserting them alongside incoming shreds.
+        for batch in recovered_batches.iter_mut() {
+            batch.validated_merkle_root_meta = None;
+            let current_meta =
+                self.merkle_root_meta_from_location(batch.erasure_set, BlockLocation::Original)?;
+            let recovered_root = batch
+                .data_shreds
+                .first()
+                .and_then(|shred| shred.merkle_root().ok());
+            let is_current = matches!(
+                (current_meta.and_then(|meta| meta.merkle_root()), recovered_root),
+                (Some(current), Some(recovered)) if current == recovered
+            );
+            if !is_current {
+                metrics.num_recovered += batch.data_shreds.len();
+                metrics.num_recovered_stale += batch.data_shreds.len();
+                batch.clear();
+                continue;
+            }
+            batch.validated_merkle_root_meta = current_meta;
+        }
+        if shreds.len() == 0
+            && recovered_batches
+                .iter()
+                .all(|batch| batch.data_shreds.is_empty())
+        {
+            return Ok(InsertResults {
+                completed_data_set_infos: Vec::new(),
+                duplicate_shreds: Vec::new(),
+                recovery_tasks: Vec::new(),
+            });
+        }
         let num_recovered = recovered_batches
             .iter()
             .map(|batch| batch.data_shreds.len())
@@ -2438,6 +2477,22 @@ impl Blockstore {
             update_parent_signals,
         );
 
+        if let Some(sender) = retransmit_sender {
+            let capacity = recovered_batches
+                .iter()
+                .map(|batch| batch.retransmit_shreds.len())
+                .sum();
+            let mut retransmit_shreds = Vec::with_capacity(capacity);
+            retransmit_shreds.extend(
+                recovered_batches
+                    .iter_mut()
+                    .flat_map(|batch| batch.retransmit_shreds.drain(..)),
+            );
+            if !retransmit_shreds.is_empty() {
+                let _ = sender.try_send(retransmit_shreds);
+            }
+        }
+
         metrics.index_meta_time_us += shred_insertion_tracker.index_meta_time_us;
         let recovery_tasks = if collect_recovery_tasks {
             let mut start = Measure::start("Prepare recovery tasks");
@@ -2455,16 +2510,18 @@ impl Blockstore {
         })
     }
 
-    /// Inserts shreds and returns any FEC sets that became recoverable. The
-    /// returned tasks retain newly inserted shreds so recovery does not need
-    /// to reload the insertion metadata from blockstore.
-    pub fn insert_shreds_at_location_prepare_recovery<'a, 'db, F>(
+    /// Inserts incoming and recovered shreds in one transaction, then collects
+    /// recovery tasks for FEC sets touched by incoming shreds. Recovered batches
+    /// are revalidated under the insertion lock and retransmitted after commit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_shreds_with_recovered<'a, 'db, F>(
         &'db self,
         shreds: impl IntoIterator<
             Item = (Cow<'a, Shred>, /*is_repaired:*/ bool, BlockLocation),
             IntoIter: ExactSizeIterator,
         >,
-        is_trusted: bool,
+        recovered_batches: &mut [RecoveredShredBatch],
+        retransmit_sender: &EvictingSender<Vec<Payload>>,
         pinnable_slice: &mut DBPinnableSlice<'db>,
         write_batch: &mut WriteBatch,
         handle_duplicate: &F,
@@ -2479,110 +2536,19 @@ impl Blockstore {
             recovery_tasks,
         } = self.do_insert_shreds(
             shreds,
-            is_trusted,
-            ShredRecoveryMode::CollectTasks,
+            false, // is_trusted
+            ShredRecoveryMode::Enabled {
+                batches: recovered_batches,
+                retransmit_sender,
+            },
             pinnable_slice,
             write_batch,
             metrics,
         )?;
-
         for shred in duplicate_shreds {
             handle_duplicate(shred);
         }
-
         Ok((completed_data_set_infos, recovery_tasks))
-    }
-
-    /// Validates and inserts data shreds produced by erasure recovery without
-    /// recursively attempting recovery again. Recovered payloads are only
-    /// retransmitted after their FEC root is validated against current state
-    /// and the recovered-data write succeeds.
-    pub fn insert_recovered_shreds<'db, F>(
-        &'db self,
-        recovered_batches: &mut [RecoveredShredBatch],
-        shred_recovery_context: &ShredRecoveryContext,
-        pinnable_slice: &mut DBPinnableSlice<'db>,
-        write_batch: &mut WriteBatch,
-        handle_duplicate: &F,
-        metrics: &mut BlockstoreInsertionMetrics,
-    ) -> Result<Vec<CompletedDataSetInfo>>
-    where
-        F: Fn(PossibleDuplicateShred),
-    {
-        write_batch.clear();
-        let mut start = Measure::start("Blockstore lock");
-        let lock = self.insert_shreds_lock.lock().unwrap();
-        start.stop();
-        metrics.insert_lock_elapsed_us += start.as_us();
-
-        // Recovery is computed from committed state without holding the insert
-        // lock. A block switch may replace that state in the meantime, so
-        // validate once per recovered FEC set while serialized with switching.
-        for batch in recovered_batches.iter_mut() {
-            batch.validated_merkle_root_meta = None;
-            let current_meta =
-                self.merkle_root_meta_from_location(batch.erasure_set, BlockLocation::Original)?;
-            let recovered_root = batch
-                .data_shreds
-                .first()
-                .and_then(|shred| shred.merkle_root().ok());
-            let is_current = matches!(
-                (current_meta.and_then(|meta| meta.merkle_root()), recovered_root),
-                (Some(current), Some(recovered)) if current == recovered
-            );
-            if !is_current {
-                metrics.num_recovered += batch.data_shreds.len();
-                metrics.num_recovered_stale += batch.data_shreds.len();
-                batch.retransmit_shreds.clear();
-                batch.data_shreds.clear();
-                continue;
-            }
-            batch.validated_merkle_root_meta = current_meta;
-        }
-        // Every reconstructed batch was made stale by a concurrent block switch.
-        if recovered_batches
-            .iter()
-            .all(|batch| batch.data_shreds.is_empty())
-        {
-            return Ok(Vec::new());
-        }
-        let result = self.do_insert_shreds_locked(
-            &lock,
-            Vec::new(),
-            false, // is_trusted
-            ShredRecoveryMode::InsertRecovered(recovered_batches),
-            pinnable_slice,
-            write_batch,
-            metrics,
-        );
-        if result.is_ok() {
-            // Keep the insert lock through this nonblocking send so a block
-            // switch cannot make the validated payloads stale first.
-            let retransmit_capacity = recovered_batches
-                .iter()
-                .map(|batch| batch.retransmit_shreds.len())
-                .sum();
-            let mut retransmit_shreds = Vec::with_capacity(retransmit_capacity);
-            retransmit_shreds.extend(
-                recovered_batches
-                    .iter_mut()
-                    .flat_map(|batch| batch.retransmit_shreds.drain(..)),
-            );
-            shred_recovery_context.try_retransmit_shreds(retransmit_shreds);
-        }
-        write_batch.clear();
-        drop(lock);
-        let InsertResults {
-            completed_data_set_infos,
-            duplicate_shreds,
-            ..
-        } = result?;
-
-        for shred in duplicate_shreds {
-            handle_duplicate(shred);
-        }
-
-        Ok(completed_data_set_infos)
     }
 
     pub fn add_new_shred_signal(&self, s: Sender<bool>) {

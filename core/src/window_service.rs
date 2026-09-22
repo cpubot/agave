@@ -14,7 +14,7 @@ use {
         result::{Error, Result},
     },
     agave_feature_set as feature_set,
-    crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError, unbounded},
+    crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError, select, unbounded},
     rayon::{ThreadPool, prelude::*},
     solana_clock::Slot,
     solana_gossip::cluster_info::ClusterInfo,
@@ -47,6 +47,11 @@ use {
 type DuplicateSlotSender = Sender<Slot>;
 pub(crate) type DuplicateSlotReceiver = Receiver<Slot>;
 
+// Each message contains one recovered FEC set, so channel capacity bounds
+// the number of recovered FEC sets awaiting insertion.
+const RECOVERED_CHANNEL_CAPACITY: usize = 64;
+const MAX_RECOVERED_BATCHES_PER_INSERT: usize = 16;
+
 #[derive(Default)]
 struct WindowServiceMetrics {
     run_insert_count: u64,
@@ -65,8 +70,10 @@ struct WindowServiceMetrics {
 
 #[derive(Default)]
 struct WindowRecoveryMetrics {
+    shred_recovery_elapsed_us: u64,
     num_recovery_tasks: usize,
     num_recovered_batches: usize,
+    num_recovered_batches_dropped: usize,
     num_recovery_tasks_failed: usize,
     recovery_queue_depth_max: usize,
 }
@@ -137,8 +144,18 @@ impl WindowRecoveryMetrics {
     fn report_metrics(&self) {
         datapoint_info!(
             Self::NAME,
+            (
+                "shred_recovery_elapsed_us",
+                self.shred_recovery_elapsed_us,
+                i64
+            ),
             ("num_recovery_tasks", self.num_recovery_tasks, i64),
             ("num_recovered_batches", self.num_recovered_batches, i64),
+            (
+                "num_recovered_batches_dropped",
+                self.num_recovered_batches_dropped,
+                i64
+            ),
             (
                 "num_recovery_tasks_failed",
                 self.num_recovery_tasks_failed,
@@ -220,6 +237,9 @@ fn run_insert<'db, F>(
     thread_pool: &ThreadPool,
     verified_receiver: &Receiver<Vec<(shred::Payload, /*is_repaired:*/ bool, BlockLocation)>>,
     recovery_sender: &EvictingSender<Vec<ShredRecoveryTask>>,
+    recovered_receiver: &Receiver<RecoveredShredBatch>,
+    recovered_batches: &mut Vec<RecoveredShredBatch>,
+    retransmit_sender: &EvictingSender<Vec<shred::Payload>>,
     blockstore: &'db Blockstore,
     pinnable_slice: &mut DBPinnableSlice<'db>,
     write_batch: &mut WriteBatch,
@@ -233,8 +253,23 @@ where
 {
     const RECV_TIMEOUT: Duration = Duration::from_millis(200);
     let mut shred_receiver_elapsed = Measure::start("shred_receiver_elapsed");
-    let mut shreds = verified_receiver.recv_timeout(RECV_TIMEOUT)?;
+    let mut shreds = Vec::new();
+    // Recovery must make progress even when no further network shreds arrive.
+    select! {
+        recv(verified_receiver) -> batch => {
+            shreds = batch.map_err(|_| RecvTimeoutError::Disconnected)?;
+        }
+        recv(recovered_receiver) -> batch => {
+            recovered_batches.push(batch.map_err(|_| RecvTimeoutError::Disconnected)?);
+        }
+        default(RECV_TIMEOUT) => return Err(RecvTimeoutError::Timeout.into()),
+    }
     shreds.extend(verified_receiver.try_iter().flatten());
+    recovered_batches.extend(
+        recovered_receiver
+            .try_iter()
+            .take(MAX_RECOVERED_BATCHES_PER_INSERT - recovered_batches.len()),
+    );
     shred_receiver_elapsed.stop();
     ws_metrics.shred_receiver_elapsed_us += shred_receiver_elapsed.as_us();
     ws_metrics.run_insert_count += 1;
@@ -255,15 +290,17 @@ where
     });
     ws_metrics.handle_packets_elapsed_us += now.elapsed().as_micros() as u64;
     ws_metrics.num_shreds_received += shreds.len();
-    let (completed_data_sets, recovery_tasks) = blockstore
-        .insert_shreds_at_location_prepare_recovery(
-            shreds,
-            false, // is_trusted
-            pinnable_slice,
-            write_batch,
-            &handle_duplicate,
-            metrics,
-        )?;
+    let result = blockstore.insert_shreds_with_recovered(
+        shreds,
+        recovered_batches,
+        retransmit_sender,
+        pinnable_slice,
+        write_batch,
+        &handle_duplicate,
+        metrics,
+    );
+    recovered_batches.clear();
+    let (completed_data_sets, recovery_tasks) = result?;
 
     ws_metrics.num_recovery_candidates += recovery_tasks.len();
     if !recovery_tasks.is_empty() {
@@ -283,22 +320,14 @@ where
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_recovery<'db, F>(
+fn run_recovery<'db>(
     recovery_receiver: &Receiver<Vec<ShredRecoveryTask>>,
+    recovered_sender: &EvictingSender<RecoveredShredBatch>,
     blockstore: &'db Blockstore,
     shred_recovery_context: &mut ShredRecoveryContext,
-    recovered_batch_scratch: &mut Vec<RecoveredShredBatch>,
     pinnable_slice: &mut DBPinnableSlice<'db>,
-    write_batch: &mut WriteBatch,
-    handle_duplicate: F,
-    metrics: &mut BlockstoreInsertionMetrics,
     recovery_metrics: &mut WindowRecoveryMetrics,
-    completed_data_sets_sender: Option<&CompletedDataSetsSender>,
-) -> Result<()>
-where
-    F: Fn(PossibleDuplicateShred),
-{
+) -> Result<()> {
     const RECV_TIMEOUT: Duration = Duration::from_millis(200);
     let mut recovery_tasks = recovery_receiver.recv_timeout(RECV_TIMEOUT)?;
     let queue_depth = recovery_receiver.len();
@@ -313,49 +342,27 @@ where
         recovery_tasks.sort_by_key(ShredRecoveryTask::erasure_set);
         recovery_tasks.dedup_by_key(|task| task.erasure_set());
     }
-    let mut next_recovered_batch = 0;
-    let mut recovery_elapsed = Measure::start("Shred recovery");
     for task in recovery_tasks {
         let erasure_set = task.erasure_set();
         if blockstore.is_erasure_set_complete(erasure_set, pinnable_slice)? {
             continue;
         }
-        // Successful batches occupy a compact prefix of the scratch buffer. A
-        // failed recovery leaves the index unchanged, so the next task reuses
-        // the same allocation.
-        if next_recovered_batch == recovered_batch_scratch.len() {
-            recovered_batch_scratch.push(RecoveredShredBatch::new(erasure_set));
-        }
-        if blockstore.recover_shreds_from_task(
-            task,
-            shred_recovery_context,
-            &mut recovered_batch_scratch[next_recovered_batch],
-        ) {
-            next_recovered_batch += 1;
-            recovery_metrics.num_recovered_batches += 1;
-        } else {
+        let mut batch = RecoveredShredBatch::new(erasure_set);
+        let now = Instant::now();
+        let recovered =
+            blockstore.recover_shreds_from_task(task, shred_recovery_context, &mut batch);
+        recovery_metrics.shred_recovery_elapsed_us += now.elapsed().as_micros() as u64;
+        if !recovered {
             recovery_metrics.num_recovery_tasks_failed += 1;
+            continue;
         }
-    }
-    recovery_elapsed.stop();
-    metrics.shred_recovery_elapsed_us += recovery_elapsed.as_us();
+        recovery_metrics.num_recovered_batches += 1;
 
-    let recovered_batches = &mut recovered_batch_scratch[..next_recovered_batch];
-    if recovered_batches.is_empty() {
-        return Ok(());
-    }
-    let completed_data_sets = blockstore.insert_recovered_shreds(
-        recovered_batches,
-        shred_recovery_context,
-        pinnable_slice,
-        write_batch,
-        &handle_duplicate,
-        metrics,
-    )?;
-    if !completed_data_sets.is_empty()
-        && let Some(sender) = completed_data_sets_sender
-    {
-        sender.try_send(completed_data_sets)?;
+        match recovered_sender.try_send(batch) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => recovery_metrics.num_recovered_batches_dropped += 1,
+            Err(TrySendError::Disconnected(_)) => return Err(Error::Send),
+        }
     }
     Ok(())
 }
@@ -458,6 +465,8 @@ impl WindowService {
         const RECOVERY_CHANNEL_CAPACITY: usize = 64;
         let (recovery_sender, recovery_receiver) =
             EvictingSender::new_bounded(RECOVERY_CHANNEL_CAPACITY);
+        let (recovered_sender, recovered_receiver) =
+            EvictingSender::new_bounded(RECOVERED_CHANNEL_CAPACITY);
         let sharable_banks = bank_forks.read().unwrap().sharable_banks();
         let t_recovery = Self::start_window_recovery_thread(
             exit.clone(),
@@ -465,15 +474,15 @@ impl WindowService {
             sharable_banks,
             shred_version,
             recovery_receiver,
-            duplicate_sender.clone(),
-            completed_data_sets_sender.clone(),
-            retransmit_sender,
+            recovered_sender,
         );
         let t_insert = Self::start_window_insert_thread(
             exit,
             blockstore,
             verified_receiver,
             recovery_sender,
+            recovered_receiver,
+            retransmit_sender,
             duplicate_sender,
             completed_data_sets_sender,
         );
@@ -514,11 +523,14 @@ impl WindowService {
             .unwrap()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn start_window_insert_thread(
         exit: Arc<AtomicBool>,
         blockstore: Arc<Blockstore>,
         verified_receiver: Receiver<Vec<(shred::Payload, /*is_repaired:*/ bool, BlockLocation)>>,
         recovery_sender: EvictingSender<Vec<ShredRecoveryTask>>,
+        recovered_receiver: Receiver<RecoveredShredBatch>,
+        retransmit_sender: EvictingSender<Vec<shred::Payload>>,
         check_duplicate_sender: Sender<PossibleDuplicateShred>,
         completed_data_sets_sender: Option<CompletedDataSetsSender>,
     ) -> JoinHandle<()> {
@@ -544,12 +556,16 @@ impl WindowService {
                 let mut last_print = Instant::now();
                 let mut pinnable_slice = blockstore.new_pinnable_slice();
                 let mut write_batch = blockstore.get_write_batch();
+                let mut recovered_batches = Vec::new();
 
                 while !exit.load(Ordering::Relaxed) {
                     if let Err(e) = run_insert(
                         &thread_pool,
                         &verified_receiver,
                         &recovery_sender,
+                        &recovered_receiver,
+                        &mut recovered_batches,
+                        &retransmit_sender,
                         &blockstore,
                         &mut pinnable_slice,
                         &mut write_batch,
@@ -565,7 +581,7 @@ impl WindowService {
                     }
 
                     if last_print.elapsed() > METRICS_REPORTING_INTERVAL {
-                        metrics.report_metrics("solWinInsert");
+                        metrics.report_metrics();
                         metrics = BlockstoreInsertionMetrics::default();
                         ws_metrics.report_metrics();
                         ws_metrics = WindowServiceMetrics::default();
@@ -576,62 +592,41 @@ impl WindowService {
             .unwrap()
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn start_window_recovery_thread(
         exit: Arc<AtomicBool>,
         blockstore: Arc<Blockstore>,
         sharable_banks: SharableBanks,
         shred_version: u16,
         recovery_receiver: Receiver<Vec<ShredRecoveryTask>>,
-        check_duplicate_sender: Sender<PossibleDuplicateShred>,
-        completed_data_sets_sender: Option<CompletedDataSetsSender>,
-        retransmit_sender: EvictingSender<Vec<shred::Payload>>,
+        recovered_sender: EvictingSender<RecoveredShredBatch>,
     ) -> JoinHandle<()> {
         Builder::new()
             .name("solWinRecover".to_string())
             .spawn(move || {
-                let handle_duplicate = |possible_duplicate_shred| {
-                    let _ = check_duplicate_sender.send(possible_duplicate_shred);
-                };
                 let mut shred_recovery_context = ShredRecoveryContext::new(
                     ReedSolomonCache::default(),
-                    retransmit_sender,
                     sharable_banks.root(),
                     shred_version,
                 );
                 let mut pinnable_slice = blockstore.new_pinnable_slice();
-                let mut write_batch = blockstore.get_write_batch();
-                let mut metrics = BlockstoreInsertionMetrics::default();
                 let mut recovery_metrics = WindowRecoveryMetrics::default();
-                let mut recovered_batch_scratch = Vec::new();
                 let mut last_print = Instant::now();
                 const METRICS_REPORTING_INTERVAL: Duration = Duration::from_secs(2);
 
                 while !exit.load(Ordering::Relaxed) {
                     shred_recovery_context.maybe_update(sharable_banks.root());
-                    let result = run_recovery(
+                    if let Err(e) = run_recovery(
                         &recovery_receiver,
+                        &recovered_sender,
                         &blockstore,
                         &mut shred_recovery_context,
-                        &mut recovered_batch_scratch,
                         &mut pinnable_slice,
-                        &mut write_batch,
-                        handle_duplicate,
-                        &mut metrics,
                         &mut recovery_metrics,
-                        completed_data_sets_sender.as_ref(),
-                    );
-                    for batch in &mut recovered_batch_scratch {
-                        batch.clear();
-                    }
-                    if let Err(e) = result
-                        && Self::should_exit_on_error(e)
+                    ) && Self::should_exit_on_error(e)
                     {
                         break;
                     }
                     if last_print.elapsed() > METRICS_REPORTING_INTERVAL {
-                        metrics.report_metrics("solWinRecover");
-                        metrics = BlockstoreInsertionMetrics::default();
                         recovery_metrics.report_metrics();
                         recovery_metrics = WindowRecoveryMetrics::default();
                         last_print = Instant::now();
@@ -728,9 +723,13 @@ mod test {
         assert_eq!(blockstore.get_slot_entries(0, 0).unwrap(), original_entries);
     }
 
-    #[test_case::test_case(false; "recovery_completes_set")]
-    #[test_case::test_case(true; "network_completes_set")]
-    fn test_run_recovery_skips_redundant_tasks(network_completes_set: bool) {
+    #[test_case::test_case(false, false; "recovery_completes_set_without_network_traffic")]
+    #[test_case::test_case(true, false; "network_completes_set_before_recovery")]
+    #[test_case::test_case(false, true; "network_and_recovery_share_insert")]
+    fn test_run_recovery_skips_redundant_tasks(
+        network_completes_set: bool,
+        concurrent_arrival: bool,
+    ) {
         let ledger_path = get_tmp_ledger_path_auto_delete!();
         let blockstore = Blockstore::open(ledger_path.path()).unwrap();
         let mut pinnable_slice = blockstore.new_pinnable_slice();
@@ -760,9 +759,10 @@ mod test {
         // set. Leave a third snapshot aside to simulate work queued during recovery.
         let mut task_batches = coding.into_iter().take(3).map(|shred| {
             let (_, tasks) = blockstore
-                .insert_shreds_at_location_prepare_recovery(
+                .insert_shreds_with_recovered(
                     [(Cow::Owned(shred), false, BlockLocation::Original)],
-                    false,
+                    &mut [],
+                    &EvictingSender::new_bounded(0).0,
                     &mut pinnable_slice,
                     &mut write_batch,
                     &|_| {},
@@ -784,28 +784,73 @@ mod test {
         let bank = Arc::new(Bank::new_for_tests(
             &create_genesis_config(2).genesis_config,
         ));
-        let mut context =
-            ShredRecoveryContext::new(ReedSolomonCache::default(), retransmit_sender, bank, 0);
-        let mut scratch = Vec::new();
+        let mut context = ShredRecoveryContext::new(ReedSolomonCache::default(), bank, 0);
+        let (recovered_sender, recovered_receiver) = EvictingSender::new_bounded(4);
+        let (verified_sender, verified_receiver) = bounded(4);
+        let (recovery_sender, recovery_receiver) = EvictingSender::new_bounded(4);
+        let (completed_sender, completed_receiver) = bounded(4);
+        let thread_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let mut ws_metrics = WindowServiceMetrics::default();
         let mut metrics = BlockstoreInsertionMetrics::default();
         let mut recovery_metrics = WindowRecoveryMetrics::default();
+        let mut recovered_batches = Vec::new();
         for tasks in [None, Some(delayed_tasks)] {
             if let Some(tasks) = tasks {
                 sender.send(tasks).unwrap();
             }
             run_recovery(
                 &receiver,
+                &recovered_sender,
                 &blockstore,
                 &mut context,
-                &mut scratch,
                 &mut pinnable_slice,
-                &mut write_batch,
-                |duplicate| panic!("unexpected duplicate: {duplicate:?}"),
-                &mut metrics,
                 &mut recovery_metrics,
-                None,
             )
             .unwrap();
+            if !recovered_receiver.is_empty() {
+                // Reconstruction alone must neither insert nor retransmit shreds.
+                assert!(
+                    !blockstore
+                        .is_erasure_set_complete(erasure_set, &mut pinnable_slice)
+                        .unwrap()
+                );
+                assert!(retransmit_receiver.is_empty());
+                if concurrent_arrival {
+                    verified_sender
+                        .send(vec![(
+                            missing.payload().clone(),
+                            false,
+                            BlockLocation::Original,
+                        )])
+                        .unwrap();
+                }
+                run_insert(
+                    &thread_pool,
+                    &verified_receiver,
+                    &recovery_sender,
+                    &recovered_receiver,
+                    &mut recovered_batches,
+                    &retransmit_sender,
+                    &blockstore,
+                    &mut pinnable_slice,
+                    &mut write_batch,
+                    |duplicate| {
+                        assert!(concurrent_arrival);
+                        assert!(matches!(duplicate, PossibleDuplicateShred::Exists(_)));
+                    },
+                    &mut metrics,
+                    &mut ws_metrics,
+                    Some(&completed_sender),
+                )
+                .unwrap();
+                assert!(recovered_receiver.is_empty());
+                assert!(verified_receiver.is_empty());
+                assert!(recovery_receiver.is_empty());
+                assert_eq!(completed_receiver.try_recv().unwrap().len(), 1);
+            }
             assert!(receiver.is_empty());
             assert!(
                 blockstore
@@ -819,7 +864,10 @@ mod test {
             usize::from(!network_completes_set)
         );
         assert_eq!(recovery_metrics.num_recovery_tasks_failed, 0);
-        assert_eq!(metrics.num_recovered_exists, 0);
+        assert_eq!(
+            metrics.num_recovered_exists,
+            usize::from(concurrent_arrival)
+        );
         assert_eq!(
             blockstore
                 .get_data_shred(missing.slot(), u64::from(missing.index()))
@@ -936,9 +984,10 @@ mod test {
                     )
                 });
             blockstore
-                .insert_shreds_at_location_prepare_recovery(
+                .insert_shreds_with_recovered(
                     shreds,
-                    false, // is_trusted
+                    &mut [],
+                    &EvictingSender::new_bounded(0).0,
                     &mut pinnable_slice,
                     &mut write_batch,
                     &handle_duplicate,
