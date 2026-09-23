@@ -94,7 +94,6 @@ pub fn get_best_repair_shreds<'db>(
     pinnable_slice: &mut DBPinnableSlice<'db>,
     slot_meta_cache: &mut AHashMap<Slot, Option<SlotMetaRepair>>,
     full_slots_cache: &mut AHashMap<Slot, NextSlots>,
-    processed_slots: &mut AHashSet<Slot>,
     repairs: &mut Vec<ShredRepairType>,
     max_new_shreds: usize,
     repair_eligibility: &mut RepairEligibility,
@@ -116,7 +115,6 @@ pub fn get_best_repair_shreds<'db>(
             Visit::Unvisited(slot) => {
                 if full_slots_cache.contains_key(&slot) {
                     visited_set.insert(slot);
-                    processed_slots.insert(slot);
                     continue;
                 }
 
@@ -131,7 +129,6 @@ pub fn get_best_repair_shreds<'db>(
                     visited_set.insert(slot);
                     if slot_meta.is_full() {
                         full_slots_cache.insert(slot, slot_meta.next_slots.clone());
-                        processed_slots.insert(slot);
                     } else {
                         let new_repairs = RepairService::generate_repairs_for_slot(
                             blockstore,
@@ -154,7 +151,6 @@ pub fn get_best_repair_shreds<'db>(
                         &next_slots,
                         &mut visited_set,
                         full_slots_cache,
-                        processed_slots,
                         repairs,
                         max_repairs,
                         repair_eligibility,
@@ -166,7 +162,6 @@ pub fn get_best_repair_shreds<'db>(
                 {
                     if slot_meta.is_full() {
                         full_slots_cache.insert(slot, slot_meta.next_slots.clone());
-                        processed_slots.insert(slot);
                     }
                     repair_unvisited_children(
                         blockstore,
@@ -174,7 +169,6 @@ pub fn get_best_repair_shreds<'db>(
                         &slot_meta.next_slots,
                         &mut visited_set,
                         full_slots_cache,
-                        processed_slots,
                         repairs,
                         max_repairs,
                         repair_eligibility,
@@ -194,7 +188,6 @@ fn repair_unvisited_children<'db>(
     next_slots: &[Slot],
     visited_set: &mut AHashSet<Slot>,
     full_slots_cache: &mut AHashMap<Slot, NextSlots>,
-    processed_slots: &mut AHashSet<Slot>,
     repairs: &mut Vec<ShredRepairType>,
     max_repairs: usize,
     repair_eligibility: &mut RepairEligibility,
@@ -210,7 +203,6 @@ fn repair_unvisited_children<'db>(
                 max_repairs,
                 *new_child_slot,
                 full_slots_cache,
-                processed_slots,
                 repair_eligibility,
                 outstanding_repairs,
             );
@@ -225,6 +217,7 @@ pub mod test {
         solana_hash::Hash,
         solana_keypair::Keypair,
         solana_ledger::{
+            blockstore_meta::SlotMeta,
             get_tmp_ledger_path,
             shred::{ProcessShredsStats, ReedSolomonCache, Shred, Shredder},
         },
@@ -309,7 +302,6 @@ pub mod test {
         let mut outstanding_repairs = HashMap::new();
         let mut slot_meta_cache = AHashMap::default();
         let mut full_slots_cache = AHashMap::default();
-        let mut processed_slots = AHashSet::default();
         let last_shred = blockstore.meta(0).unwrap().unwrap().received;
         let mut repair_eligibility =
             RepairEligibility::elapsed_for_slots_for_tests(&blockstore, 0..=5);
@@ -320,7 +312,6 @@ pub mod test {
             &mut pinnable_slice,
             &mut slot_meta_cache,
             &mut full_slots_cache,
-            &mut processed_slots,
             &mut repairs,
             6,
             &mut repair_eligibility,
@@ -340,7 +331,6 @@ pub mod test {
         repairs = vec![];
         outstanding_repairs = HashMap::new();
         slot_meta_cache = AHashMap::default();
-        processed_slots.clear();
         let best_overall_slot = heaviest_subtree_fork_choice.best_overall_slot().0;
         assert_eq!(best_overall_slot, 4);
         blockstore.add_tree(
@@ -359,7 +349,6 @@ pub mod test {
             &mut pinnable_slice,
             &mut slot_meta_cache,
             &mut full_slots_cache,
-            &mut processed_slots,
             &mut repairs,
             6,
             &mut repair_eligibility,
@@ -378,7 +367,6 @@ pub mod test {
         repairs = vec![];
         outstanding_repairs = HashMap::new();
         slot_meta_cache = AHashMap::default();
-        processed_slots.clear();
         let keypair = Keypair::new();
         let reed_solomon_cache = ReedSolomonCache::default();
 
@@ -409,7 +397,6 @@ pub mod test {
             &mut pinnable_slice,
             &mut slot_meta_cache,
             &mut full_slots_cache,
-            &mut processed_slots,
             &mut repairs,
             4,
             &mut repair_eligibility,
@@ -429,7 +416,6 @@ pub mod test {
         repairs = vec![];
         outstanding_repairs = HashMap::new();
         slot_meta_cache = AHashMap::default();
-        processed_slots.clear();
         blockstore.add_tree(tr(2) / (tr(8)), true, false, 2, Hash::default());
         full_slots_cache.clear();
         let mut repair_eligibility =
@@ -440,7 +426,6 @@ pub mod test {
             &mut pinnable_slice,
             &mut slot_meta_cache,
             &mut full_slots_cache,
-            &mut processed_slots,
             &mut repairs,
             5,
             &mut repair_eligibility,
@@ -460,7 +445,6 @@ pub mod test {
             &mut pinnable_slice,
             &mut slot_meta_cache,
             &mut full_slots_cache,
-            &mut processed_slots,
             &mut repairs,
             1,
             &mut repair_eligibility,
@@ -482,7 +466,6 @@ pub mod test {
         let mut outstanding_repairs = HashMap::new();
         let mut slot_meta_cache = AHashMap::default();
         let mut full_slots_cache = AHashMap::default();
-        let mut processed_slots = AHashSet::default();
         let mut repair_eligibility =
             RepairEligibility::elapsed_for_slots_for_tests(&blockstore, 0..=7);
         get_best_repair_shreds(
@@ -491,7 +474,6 @@ pub mod test {
             &mut pinnable_slice,
             &mut slot_meta_cache,
             &mut full_slots_cache,
-            &mut processed_slots,
             &mut repairs,
             usize::MAX,
             &mut repair_eligibility,
@@ -519,7 +501,6 @@ pub mod test {
         let mut outstanding_repairs = HashMap::new();
         let mut slot_meta_cache = AHashMap::default();
         let mut full_slots_cache = AHashMap::default();
-        let mut processed_slots = AHashSet::default();
         let mut repair_eligibility =
             RepairEligibility::elapsed_for_slots_for_tests(&blockstore, 0..=7);
 
@@ -529,7 +510,6 @@ pub mod test {
             &mut pinnable_slice,
             &mut slot_meta_cache,
             &mut full_slots_cache,
-            &mut processed_slots,
             &mut repairs,
             usize::MAX,
             &mut repair_eligibility,
@@ -538,7 +518,6 @@ pub mod test {
 
         assert_eq!(full_slots_cache.get(&6).unwrap().as_slice(), &[7]);
         assert!(full_slots_cache.get(&7).unwrap().is_empty());
-        assert!(processed_slots.is_superset(&AHashSet::from([6, 7])));
         let last_shred = blockstore.meta(0).unwrap().unwrap().received;
         assert_eq!(
             repairs,
@@ -553,12 +532,26 @@ pub mod test {
     fn test_generate_repairs_for_fork_uses_cached_topology_without_meta() {
         let ledger_path = get_tmp_ledger_path!();
         let blockstore = Blockstore::open(&ledger_path).unwrap();
+        // Only the incomplete descendant has metadata. Reaching it requires following both
+        // cached parents, with no fallback to Blockstore for their child links.
+        blockstore
+            .put_meta(
+                8,
+                &SlotMeta {
+                    slot: 8,
+                    parent_slot: Some(7),
+                    ..SlotMeta::default()
+                },
+            )
+            .unwrap();
+        assert!(blockstore.meta(6).unwrap().is_none());
+        assert!(blockstore.meta(7).unwrap().is_none());
         let mut pinnable_slice = blockstore.new_pinnable_slice();
         let mut repairs = vec![];
         let mut outstanding_repairs = HashMap::new();
-        let mut full_slots_cache = AHashMap::from([(6, vec![7].into()), (7, NextSlots::new())]);
-        let mut processed_slots = AHashSet::default();
-        let mut repair_eligibility = RepairEligibility::default();
+        let mut full_slots_cache = AHashMap::from([(6, vec![7].into()), (7, vec![8].into())]);
+        let mut repair_eligibility =
+            RepairEligibility::elapsed_for_slots_for_tests(&blockstore, [8]);
 
         RepairService::generate_repairs_for_fork(
             &blockstore,
@@ -567,13 +560,11 @@ pub mod test {
             usize::MAX,
             6,
             &mut full_slots_cache,
-            &mut processed_slots,
             &mut repair_eligibility,
             &mut outstanding_repairs,
         );
 
-        assert!(repairs.is_empty());
-        assert_eq!(processed_slots, AHashSet::from([6, 7]));
+        assert_eq!(repairs, [ShredRepairType::HighestShred(8, 0)]);
     }
 
     #[test]
@@ -584,7 +575,6 @@ pub mod test {
         let mut outstanding_repairs = HashMap::new();
         let mut slot_meta_cache = AHashMap::default();
         let mut full_slots_cache = AHashMap::default();
-        let mut processed_slots = AHashSet::default();
         let mut repair_eligibility =
             RepairEligibility::elapsed_for_slots_for_tests(&blockstore, 0..=5);
 
@@ -594,7 +584,6 @@ pub mod test {
             &mut pinnable_slice,
             &mut slot_meta_cache,
             &mut full_slots_cache,
-            &mut processed_slots,
             &mut repairs,
             1,
             &mut repair_eligibility,
@@ -615,7 +604,6 @@ pub mod test {
         let mut slot_meta_cache = AHashMap::default();
         let mut full_slots_cache: AHashMap<Slot, NextSlots> =
             AHashMap::from([(0, vec![1].into()), (1, vec![2, 3].into())]);
-        let mut processed_slots = AHashSet::default();
         let mut repair_eligibility =
             RepairEligibility::elapsed_for_slots_for_tests(&blockstore, 0..=5);
 
@@ -625,7 +613,6 @@ pub mod test {
             &mut pinnable_slice,
             &mut slot_meta_cache,
             &mut full_slots_cache,
-            &mut processed_slots,
             &mut repairs,
             1,
             &mut repair_eligibility,
@@ -635,7 +622,6 @@ pub mod test {
         assert_eq!(repairs.len(), 1);
         assert_eq!(repairs[0].slot(), 2);
         assert_eq!(slot_meta_cache.keys().copied().collect::<Vec<_>>(), [2]);
-        assert!(processed_slots.is_superset(&AHashSet::from([0, 1])));
     }
 
     #[test]
@@ -653,7 +639,6 @@ pub mod test {
             (4, vec![].into()),
             (5, vec![].into()),
         ]);
-        let mut processed_slots = AHashSet::default();
         let mut repair_eligibility =
             RepairEligibility::elapsed_for_slots_for_tests(&blockstore, 0..=5);
 
@@ -663,7 +648,6 @@ pub mod test {
             &mut pinnable_slice,
             &mut slot_meta_cache,
             &mut full_slots_cache,
-            &mut processed_slots,
             &mut repairs,
             usize::MAX,
             &mut repair_eligibility,
@@ -671,7 +655,6 @@ pub mod test {
         );
 
         assert!(slot_meta_cache.is_empty());
-        assert_eq!(processed_slots, AHashSet::from_iter(0..=5));
     }
 
     fn setup_forks() -> (Blockstore, HeaviestSubtreeForkChoice) {

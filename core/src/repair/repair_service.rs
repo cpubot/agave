@@ -20,7 +20,7 @@ use {
     agave_votor_messages::{
         VerifiedVotorSlotsMessage, VoteAccountPubkeys, migration::MigrationStatus,
     },
-    ahash::{AHashMap, AHashSet},
+    ahash::AHashMap,
     bytes::Bytes,
     crossbeam_channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSender},
     lazy_lru::LruCache,
@@ -1109,7 +1109,7 @@ impl RepairService {
     /// Repairs a Blockstore fork starting at `slot`, reusing validated metadata for full slots.
     ///
     /// Full slots cannot need shred repair, so their child topology is retained across repair
-    /// iterations and they are recorded in `processed_slots` for the remaining repair strategies.
+    /// iterations and reused by the remaining repair strategies.
     #[allow(clippy::too_many_arguments)]
     pub fn generate_repairs_for_fork<'db>(
         blockstore: &'db Blockstore,
@@ -1118,7 +1118,6 @@ impl RepairService {
         max_repairs: usize,
         slot: Slot,
         full_slots_cache: &mut AHashMap<Slot, NextSlots>,
-        processed_slots: &mut AHashSet<Slot>,
         repair_eligibility: &mut RepairEligibility,
         outstanding_repairs: &mut HashMap<ShredRepairType, u64>,
     ) {
@@ -1126,7 +1125,6 @@ impl RepairService {
         while repairs.len() < max_repairs && !pending_slots.is_empty() {
             let slot = pending_slots.pop().unwrap();
             if let Some(next_slots) = full_slots_cache.get(&slot) {
-                processed_slots.insert(slot);
                 pending_slots.extend(next_slots.iter().copied());
                 continue;
             }
@@ -1143,7 +1141,6 @@ impl RepairService {
                 repairs.extend(new_repairs);
                 let next_slots = slot_meta.next_slots;
                 if is_full {
-                    processed_slots.insert(slot);
                     pending_slots.extend(next_slots.iter().copied());
                     full_slots_cache.insert(slot, next_slots);
                 } else {
