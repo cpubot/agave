@@ -87,6 +87,8 @@ impl Iterator for RepairWeightTraversal<'_> {
 /// Generate shred repairs for `tree` starting at `tree.root`.
 /// Prioritized by stake weight, additionally considers children not present in `tree` but in
 /// blockstore.
+/// Returns full-slot cache hits and misses for weighted candidate visits, excluding postorder
+/// and Blockstore-only traversal lookups. Misses may be served by the per-iteration metadata cache.
 #[allow(clippy::too_many_arguments)]
 pub fn get_best_repair_shreds<'db>(
     tree: &HeaviestSubtreeForkChoice,
@@ -98,12 +100,14 @@ pub fn get_best_repair_shreds<'db>(
     max_new_shreds: usize,
     repair_eligibility: &mut RepairEligibility,
     outstanding_repairs: &mut HashMap<ShredRepairType, u64>,
-) {
+) -> (u64, u64) {
     let initial_len = repairs.len();
     let max_repairs = initial_len + max_new_shreds;
     if repairs.len() >= max_repairs {
-        return;
+        return (0, 0);
     }
+    let mut cache_hits = 0;
+    let mut cache_misses = 0;
     let weighted_iter = RepairWeightTraversal::new(tree);
     let mut visited_set = AHashSet::new();
     for next in weighted_iter {
@@ -114,10 +118,12 @@ pub fn get_best_repair_shreds<'db>(
         match next {
             Visit::Unvisited(slot) => {
                 if full_slots_cache.contains_key(&slot) {
+                    cache_hits += 1;
                     visited_set.insert(slot);
                     continue;
                 }
 
+                cache_misses += 1;
                 let slot_meta = slot_meta_cache
                     .entry(slot)
                     .or_insert_with(|| blockstore.meta_repair_into(slot, pinnable_slice).unwrap());
@@ -178,6 +184,7 @@ pub fn get_best_repair_shreds<'db>(
             }
         }
     }
+    (cache_hits, cache_misses)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -504,7 +511,7 @@ pub mod test {
         let mut repair_eligibility =
             RepairEligibility::elapsed_for_slots_for_tests(&blockstore, 0..=7);
 
-        get_best_repair_shreds(
+        let cache_stats = get_best_repair_shreds(
             &heaviest_subtree_fork_choice,
             &blockstore,
             &mut pinnable_slice,
@@ -526,6 +533,7 @@ pub mod test {
                 .map(|slot| ShredRepairType::HighestShred(slot, last_shred))
                 .collect::<Vec<_>>()
         );
+        assert_eq!(cache_stats, (0, 6));
     }
 
     #[test]
@@ -578,7 +586,7 @@ pub mod test {
         let mut repair_eligibility =
             RepairEligibility::elapsed_for_slots_for_tests(&blockstore, 0..=5);
 
-        get_best_repair_shreds(
+        let cache_stats = get_best_repair_shreds(
             &heaviest_subtree_fork_choice,
             &blockstore,
             &mut pinnable_slice,
@@ -593,6 +601,7 @@ pub mod test {
         assert_eq!(repairs.len(), 1);
         assert_eq!(repairs.len(), outstanding_repairs.len());
         assert_eq!(slot_meta_cache.len(), 1);
+        assert_eq!(cache_stats, (0, 1));
     }
 
     #[test]
@@ -655,6 +664,38 @@ pub mod test {
         );
 
         assert!(slot_meta_cache.is_empty());
+    }
+
+    #[test]
+    fn test_full_slots_cache_stats_cold_and_warm_traversals() {
+        let ledger_path = get_tmp_ledger_path!();
+        let blockstore = Blockstore::open(&ledger_path).unwrap();
+        let forks = tr(0) / (tr(1) / tr(2));
+        blockstore.add_tree(forks.clone(), false, true, 2, Hash::default());
+        let tree = HeaviestSubtreeForkChoice::new_from_tree(forks);
+        let mut pinnable_slice = blockstore.new_pinnable_slice();
+        let mut full_slots_cache = AHashMap::default();
+
+        for (limit, expected) in [(0, (0, 0)), (usize::MAX, (0, 3)), (usize::MAX, (3, 0))] {
+            let mut slot_meta_cache = AHashMap::default();
+            let mut repairs = Vec::new();
+            let cache_stats = get_best_repair_shreds(
+                &tree,
+                &blockstore,
+                &mut pinnable_slice,
+                &mut slot_meta_cache,
+                &mut full_slots_cache,
+                &mut repairs,
+                limit,
+                &mut RepairEligibility::default(),
+                &mut HashMap::new(),
+            );
+
+            assert!(repairs.is_empty());
+            // Cold traversal counts only misses, even though postorder reuses the new entries.
+            assert_eq!(cache_stats, expected);
+            assert_eq!(slot_meta_cache.len(), expected.1 as usize);
+        }
     }
 
     fn setup_forks() -> (Blockstore, HeaviestSubtreeForkChoice) {

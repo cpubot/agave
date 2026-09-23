@@ -445,6 +445,9 @@ impl RepairTiming {
 
 #[derive(Default, Debug)]
 pub struct BestRepairsStats {
+    /// Full-slot cache lookups for weighted candidate visits only.
+    pub weighted_shreds_cache_hits: u64,
+    pub weighted_shreds_cache_misses: u64,
     pub call_count: u64,
     pub num_orphan_slots: u64,
     pub num_orphan_repairs: u64,
@@ -490,6 +493,16 @@ impl BestRepairsStats {
         datapoint_info!(
             "serve_repair-best-repairs",
             ("call-count", self.call_count, i64),
+            (
+                "weighted-shreds-cache-hits",
+                self.weighted_shreds_cache_hits,
+                i64
+            ),
+            (
+                "weighted-shreds-cache-misses",
+                self.weighted_shreds_cache_misses,
+                i64
+            ),
             ("orphan-slots", self.num_orphan_slots, i64),
             ("orphan-repairs", self.num_orphan_repairs, i64),
             ("best-shreds-slots", self.num_best_shreds_slots, i64),

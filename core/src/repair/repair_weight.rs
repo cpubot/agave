@@ -257,7 +257,7 @@ impl RepairWeight {
         let mut get_best_shreds_us = Measure::start("get_best_shreds_us");
         let mut best_shreds_repairs = Vec::default();
         // Find the best incomplete slots in rooted subtree
-        self.get_best_shreds(
+        let (cache_hits, cache_misses) = self.get_best_shreds(
             blockstore,
             pinnable_slice,
             &mut slot_meta_cache,
@@ -267,6 +267,10 @@ impl RepairWeight {
             repair_eligibility,
             outstanding_repairs,
         );
+        repair_metrics.best_repairs_stats.weighted_shreds_cache_hits += cache_hits;
+        repair_metrics
+            .best_repairs_stats
+            .weighted_shreds_cache_misses += cache_misses;
         let num_best_shreds_repairs = best_shreds_repairs.len();
         let repair_slots_set: HashSet<Slot> =
             best_shreds_repairs.iter().map(|r| r.slot()).collect();
@@ -562,7 +566,7 @@ impl RepairWeight {
         max_new_shreds: usize,
         repair_eligibility: &mut RepairEligibility,
         outstanding_repairs: &mut HashMap<ShredRepairType, u64>,
-    ) {
+    ) -> (u64, u64) {
         let root_tree = self.trees.get(&self.root).expect("Root tree must exist");
         repair_weighted_traversal::get_best_repair_shreds(
             root_tree,
@@ -574,7 +578,7 @@ impl RepairWeight {
             max_new_shreds,
             repair_eligibility,
             outstanding_repairs,
-        );
+        )
     }
 
     fn get_best_orphans(
