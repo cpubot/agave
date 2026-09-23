@@ -203,7 +203,7 @@ fn repair_unvisited_children<'db>(
     // All weighted children have been explored. Repair any remaining Blockstore-only children.
     for new_child_slot in next_slots {
         if visited_set.insert(*new_child_slot) {
-            RepairService::generate_repairs_for_fork_with_cache(
+            RepairService::generate_repairs_for_fork(
                 blockstore,
                 pinnable_slice,
                 repairs,
@@ -560,7 +560,7 @@ pub mod test {
         let mut processed_slots = AHashSet::default();
         let mut repair_eligibility = RepairEligibility::default();
 
-        RepairService::generate_repairs_for_fork_with_cache(
+        RepairService::generate_repairs_for_fork(
             &blockstore,
             &mut pinnable_slice,
             &mut repairs,

@@ -1106,35 +1106,12 @@ impl RepairService {
         }
     }
 
-    /// Repairs any fork starting at the input slot (uses blockstore for fork info).
-    pub fn generate_repairs_for_fork<'db>(
-        blockstore: &'db Blockstore,
-        pinnable_slice: &mut DBPinnableSlice<'db>,
-        repairs: &mut Vec<ShredRepairType>,
-        max_repairs: usize,
-        slot: Slot,
-        repair_eligibility: &mut RepairEligibility,
-        outstanding_repairs: &mut HashMap<ShredRepairType, u64>,
-    ) {
-        Self::generate_repairs_for_fork_with_cache(
-            blockstore,
-            pinnable_slice,
-            repairs,
-            max_repairs,
-            slot,
-            &mut AHashMap::new(),
-            &mut AHashSet::new(),
-            repair_eligibility,
-            outstanding_repairs,
-        );
-    }
-
     /// Repairs a Blockstore fork starting at `slot`, reusing validated metadata for full slots.
     ///
     /// Full slots cannot need shred repair, so their child topology is retained across repair
     /// iterations and they are recorded in `processed_slots` for the remaining repair strategies.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn generate_repairs_for_fork_with_cache<'db>(
+    pub fn generate_repairs_for_fork<'db>(
         blockstore: &'db Blockstore,
         pinnable_slice: &mut DBPinnableSlice<'db>,
         repairs: &mut Vec<ShredRepairType>,
