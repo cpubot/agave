@@ -534,6 +534,15 @@ impl RepairWeight {
         self.root
     }
 
+    /// Highest disconnected tree root, excluding forks already pruned by replay.
+    pub(super) fn highest_orphan(&self) -> Option<Slot> {
+        self.trees
+            .keys()
+            .copied()
+            .filter(|slot| *slot != self.root)
+            .max()
+    }
+
     // Generate shred repairs for main subtree rooted at `self.root`
     fn get_best_shreds<'db>(
         &mut self,
@@ -1067,6 +1076,17 @@ mod test {
         solana_runtime::{bank::Bank, bank_utils},
         trees::tr,
     };
+
+    #[test]
+    fn test_highest_orphan_excludes_root_and_pruned_forks() {
+        let mut weight = RepairWeight::new(100);
+        assert_eq!(weight.highest_orphan(), None);
+        weight.insert_new_pruned_tree(300);
+        assert_eq!(weight.highest_orphan(), None);
+        weight.insert_new_tree(200);
+        weight.insert_new_tree(250);
+        assert_eq!(weight.highest_orphan(), Some(250));
+    }
 
     #[test]
     fn test_sort_by_stake_weight_slot() {

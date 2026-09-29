@@ -9,6 +9,7 @@ use {
                 AncestorHashesChannels, AncestorHashesReplayUpdateReceiver, AncestorHashesService,
             },
             duplicate_repair_status::AncestorDuplicateSlotToRepair,
+            forward_repair::ForwardRepair,
             outstanding_requests::OutstandingRequests,
             repair_weight::RepairWeight,
             serve_repair::{
@@ -599,6 +600,7 @@ impl RepairServiceChannels {
 }
 
 struct RepairTracker {
+    forward_repair: ForwardRepair,
     sharable_banks: SharableBanks,
     repair_weight: RepairWeight,
     serve_repair: ServeRepair,
@@ -750,7 +752,8 @@ impl RepairService {
         blockstore: &'db Blockstore,
         pinnable_slice: &mut DBPinnableSlice<'db>,
         root_bank: Arc<Bank>,
-        _repair_info: &RepairInfo,
+        bank_forks: &RwLock<BankForks>,
+        forward_repair: Option<(&mut ForwardRepair, impl FnOnce() -> Instant)>,
         repair_weight: &mut RepairWeight,
         repair_eligibility: &mut RepairEligibility,
         outstanding_repairs: &mut HashMap<ShredRepairType, u64>,
@@ -765,7 +768,7 @@ impl RepairService {
         repair_metrics.timing.purge_outstanding_repairs_us += purge_outstanding_repairs_us.as_us();
         repair_eligibility.set_root(root_bank.slot());
 
-        repair_weight.get_best_weighted_repairs(
+        let mut repairs = repair_weight.get_best_weighted_repairs(
             blockstore,
             pinnable_slice,
             root_bank.epoch_stakes_map(),
@@ -777,7 +780,41 @@ impl RepairService {
             repair_eligibility,
             repair_metrics,
             outstanding_repairs,
-        )
+        );
+        if let Some((forward_repair, clock)) = forward_repair
+            && let now = clock()
+            && forward_repair.check_due(now)
+        {
+            let (mut frontiers, mut ancestors) =
+                ForwardRepair::frozen_frontiers(&bank_forks.read().unwrap());
+            frontiers.retain(|slot| !repair_weight.is_pruned(*slot));
+            ancestors.retain(|slot| !repair_weight.is_pruned(*slot));
+            // Includes raw blockstore orphans selected by normal repair even
+            // before gossip votes have populated RepairWeight's trees. Reuse
+            // existing selection and its retry lifetime; do not scan the DB again.
+            let highest_orphan = outstanding_repairs
+                .keys()
+                .filter_map(|request| match request {
+                    ShredRepairType::Orphan(slot) if !repair_weight.is_pruned(*slot) => Some(*slot),
+                    _ => None,
+                })
+                .chain(repair_weight.highest_orphan())
+                .max();
+            let mut probes = forward_repair.generate(
+                blockstore,
+                pinnable_slice,
+                &frontiers,
+                &ancestors,
+                highest_orphan,
+                outstanding_repairs,
+                now,
+            );
+            if !probes.is_empty() {
+                probes.append(&mut repairs);
+                repairs = probes;
+            }
+        }
+        repairs
     }
 
     fn handle_popular_pruned_forks(
@@ -891,6 +928,7 @@ impl RepairService {
             popular_pruned_forks_sender,
         } = repair_channels;
         let RepairTracker {
+            forward_repair,
             sharable_banks,
             repair_weight,
             serve_repair,
@@ -917,7 +955,8 @@ impl RepairService {
             blockstore,
             pinnable_slice,
             root_bank.clone(),
-            repair_info,
+            &repair_info.bank_forks,
+            (!migration_status.is_alpenglow_enabled()).then_some((forward_repair, Instant::now)),
             repair_weight,
             repair_eligibility,
             outstanding_repairs,
@@ -965,6 +1004,7 @@ impl RepairService {
         };
         let root_bank_slot = sharable_banks.root().slot();
         let mut repair_tracker = RepairTracker {
+            forward_repair: ForwardRepair::default(),
             sharable_banks: sharable_banks.clone(),
             repair_weight: RepairWeight::new(root_bank_slot),
             serve_repair: {
@@ -1127,8 +1167,6 @@ impl RepairService {
 
         // Return the pubkey and repair socket address for the sampled peers.
         weighted_sample_repair_peers
-            .collect::<Vec<_>>()
-            .iter()
             .map(|(pubkey, addr, _)| (*pubkey, *addr))
             .collect()
     }
@@ -1457,6 +1495,297 @@ mod test {
         solana_time_utils::timestamp,
         std::{collections::HashSet, sync::Arc},
     };
+
+    struct ForwardSelectionTest {
+        banks: Arc<RwLock<BankForks>>,
+        weight: RepairWeight,
+        forward: ForwardRepair,
+        eligibility: RepairEligibility,
+        outstanding: HashMap<ShredRepairType, u64>,
+        metrics: RepairMetrics,
+    }
+
+    impl ForwardSelectionTest {
+        fn new() -> Self {
+            let genesis = create_genesis_config(10_000);
+            let bank = Bank::new_for_tests(&genesis.genesis_config);
+            bank.fill_bank_with_ticks_for_tests();
+            bank.freeze();
+            Self {
+                banks: BankForks::new_rw_arc(bank),
+                weight: RepairWeight::new(0),
+                forward: ForwardRepair::default(),
+                eligibility: RepairEligibility::default(),
+                outstanding: HashMap::new(),
+                metrics: RepairMetrics::default(),
+            }
+        }
+
+        fn select(
+            &mut self,
+            store: &Blockstore,
+            probe_at: Option<Instant>,
+        ) -> Vec<ShredRepairType> {
+            let root = self.banks.read().unwrap().root_bank();
+            RepairService::identify_repairs(
+                store,
+                &mut store.new_pinnable_slice(),
+                root,
+                &self.banks,
+                probe_at.map(|now| (&mut self.forward, move || now)),
+                &mut self.weight,
+                &mut self.eligibility,
+                &mut self.outstanding,
+                &mut self.metrics,
+            )
+        }
+
+        fn freeze_fork(&mut self, parent: Slot, slot: Slot) {
+            let root = self.banks.read().unwrap().get(parent).unwrap();
+            let bank =
+                Bank::new_from_parent(root, solana_leader_schedule::SlotLeader::default(), slot);
+            bank.freeze();
+            self.banks.write().unwrap().insert(bank);
+        }
+    }
+
+    fn insert_startup_orphan(store: &Blockstore) {
+        let (root_shreds, _) = make_slot_entries(0, 0, 1);
+        store.insert_shreds(root_shreds, false).unwrap();
+        let (orphan, _) = make_slot_entries(200, 199, 1);
+        store
+            .insert_shreds(vec![orphan.last().unwrap().clone()], false)
+            .unwrap();
+    }
+
+    #[test]
+    fn test_forward_selection_without_votes_repairs_and_replays_child() {
+        use {
+            crate::repair::repair_handler::RepairHandler,
+            solana_ledger::{
+                blockstore_processor::{
+                    ConfirmationProgress, ProcessOptions, ReplayVerificationWorkerPool,
+                    fill_blockstore_slot_with_ticks, process_single_slot,
+                },
+                shred::Shred,
+            },
+            solana_perf::packet::PacketFlags,
+            solana_svm_timings::ExecuteTimings,
+        };
+        let path = get_tmp_ledger_path_auto_delete!();
+        let remote_path = get_tmp_ledger_path_auto_delete!();
+        let store = Blockstore::open(path.path()).unwrap();
+        let remote = Arc::new(Blockstore::open(remote_path.path()).unwrap());
+        insert_startup_orphan(&store);
+        let mut test = ForwardSelectionTest::new();
+        let root = test.banks.read().unwrap().root_bank();
+        fill_blockstore_slot_with_ticks(
+            &remote,
+            root.ticks_per_slot(),
+            1,
+            0,
+            root.last_blockhash(),
+        );
+        let handler = StandardRepairHandler::new(remote);
+        let addr = "127.0.0.1:1234".parse().unwrap();
+        let deliver = |request| {
+            let mut packets = match request {
+                ShredRepairType::HighestShred(slot, index) => {
+                    handler.run_highest_window_request(&addr, slot, index, 42)
+                }
+                ShredRepairType::Shred(slot, index) => {
+                    handler.run_window_request(&addr, slot, index, 42)
+                }
+                _ => panic!("unexpected child repair"),
+            }
+            .unwrap();
+            let shreds: Vec<_> = packets
+                .iter_mut()
+                .map(|mut packet| {
+                    packet.meta_mut().flags |= PacketFlags::REPAIR;
+                    let (bytes, nonce) =
+                        shred::layout::get_shred_and_repair_nonce(packet.as_ref()).unwrap();
+                    assert_eq!(nonce, Some(42));
+                    Shred::new_from_serialized_shred(bytes.to_vec()).unwrap()
+                })
+                .collect();
+            store.insert_shreds(shreds, false).unwrap();
+        };
+
+        // Same selector as the live loop. No fabricated orphan hint and no votes.
+        // With probing disabled (the Alpenglow path), only ordinary repair runs.
+        let ordinary = test.select(&store, None);
+        assert!(ordinary.contains(&ShredRepairType::Orphan(199)));
+        assert_eq!(test.weight.highest_orphan(), None);
+        assert!(!ordinary.contains(&ShredRepairType::HighestShred(1, 0)));
+        let now = Instant::now();
+        let repairs = test.select(&store, Some(now));
+        assert!(repairs.contains(&ShredRepairType::HighestShred(1, 0)));
+        assert_eq!(
+            &repairs[..8],
+            &(1..=8)
+                .map(|slot| ShredRepairType::HighestShred(slot, 0))
+                .collect::<Vec<_>>()
+        );
+        // Delay orphan responses, demonstrating that forward selection alone
+        // supplies the parent link needed by normal rooted repair.
+        deliver(ShredRepairType::HighestShred(1, 0));
+        assert_eq!(store.meta(0).unwrap().unwrap().next_slots.as_slice(), &[1]);
+        assert!(!store.meta(1).unwrap().unwrap().is_full());
+
+        // First observation is deferred by production FEC eligibility. Advance
+        // that observation's test clock, then let the production scheduler choose
+        // indexes and enforce the ordinary request budget.
+        let deferred = test.select(&store, Some(now));
+        assert!(
+            !deferred
+                .iter()
+                .any(|request| matches!(request, ShredRepairType::Shred(1, _)))
+        );
+        test.eligibility
+            .observe_slot_as_elapsed_for_tests(1, &store.meta_repair(1).unwrap().unwrap());
+        let repairs = test.select(&store, Some(now));
+        let child_repairs: Vec<_> = repairs
+            .into_iter()
+            .filter(|r| matches!(r, ShredRepairType::Shred(1, _)))
+            .collect();
+        assert!(!child_repairs.is_empty());
+        assert!(child_repairs.len() <= MAX_REPAIR_LENGTH);
+        assert!(test.metrics.best_repairs_stats.num_best_shreds_repairs > 0);
+        for request in child_repairs {
+            deliver(request);
+        }
+        assert!(store.meta(1).unwrap().unwrap().is_full());
+
+        // Exercise actual ledger replay and freezing, not just blockstore fullness.
+        let child = Bank::new_from_parent(
+            root.clone(),
+            solana_leader_schedule::SlotLeader::default(),
+            1,
+        );
+        let child = test.banks.write().unwrap().insert(child);
+        process_single_slot(
+            &store,
+            &child,
+            0,
+            &ReplayVerificationWorkerPool::new(1),
+            &ProcessOptions {
+                run_verification: true,
+                // Test shred helpers do not encode the snapshot parent's block ID.
+                skip_inter_slot_verification: true,
+                ..ProcessOptions::default()
+            },
+            &mut ConfirmationProgress::new(root.last_blockhash()),
+            None,
+            None,
+            None,
+            &mut ExecuteTimings::default(),
+            &MigrationStatus::default(),
+        )
+        .unwrap();
+        assert!(child.is_frozen());
+        assert!(!store.is_dead(1));
+        assert_eq!(
+            ForwardRepair::frozen_frontiers(&test.banks.read().unwrap()),
+            (
+                std::collections::BTreeSet::from([1]),
+                std::collections::BTreeSet::from([0])
+            )
+        );
+    }
+
+    #[test]
+    fn test_forward_selection_competing_forks_and_unusable_child() {
+        for dead in [false, true] {
+            let path = get_tmp_ledger_path_auto_delete!();
+            let store = Blockstore::open(path.path()).unwrap();
+            insert_startup_orphan(&store);
+            let mut test = ForwardSelectionTest::new();
+            for slot in [100, 120] {
+                test.freeze_fork(0, slot);
+                let (shreds, _) = make_slot_entries(slot, 0, 1);
+                store.insert_shreds(shreds, false).unwrap();
+            }
+            let (child, _) = make_slot_entries(101, 100, 1);
+            store
+                .insert_shreds(vec![child.last().unwrap().clone()], false)
+                .unwrap();
+            if dead {
+                store.set_dead_slot(101).unwrap();
+            }
+            let now = Instant::now();
+            let repairs = test.select(&store, Some(now));
+            assert!(repairs.contains(&ShredRepairType::HighestShred(121, 0)));
+            assert_eq!(
+                repairs.contains(&ShredRepairType::HighestShred(104, 0)),
+                dead
+            );
+            assert!(
+                repairs
+                    .iter()
+                    .filter(|r| matches!(r, ShredRepairType::HighestShred(_, 0)))
+                    .count()
+                    <= 8
+            );
+            if !dead {
+                let repairs = test.select(&store, Some(now + Duration::from_secs(1)));
+                assert!(repairs.contains(&ShredRepairType::HighestShred(102, 0)));
+                assert!(
+                    repairs
+                        .iter()
+                        .filter(|r| matches!(r, ShredRepairType::HighestShred(_, 0)))
+                        .count()
+                        <= 8
+                );
+                let repairs = test.select(&store, Some(now + Duration::from_millis(1150)));
+                assert!(repairs.contains(&ShredRepairType::HighestShred(104, 0)));
+            }
+        }
+    }
+
+    #[test]
+    fn test_forward_selection_unknown_sibling_of_frozen_child() {
+        let path = get_tmp_ledger_path_auto_delete!();
+        let store = Blockstore::open(path.path()).unwrap();
+        insert_startup_orphan(&store);
+        let mut test = ForwardSelectionTest::new();
+        for (parent, slot) in [(0, 100), (100, 120)] {
+            test.freeze_fork(parent, slot);
+            let (shreds, _) = make_slot_entries(slot, parent, 1);
+            store.insert_shreds(shreds, false).unwrap();
+        }
+        // 120 is a completed child of 100, but unknown 101 could be a viable
+        // sibling. Retain 100 as a fallback while prioritizing the tip at 120.
+        let now = Instant::now();
+        let mut discovered = false;
+        for step in 0..12 {
+            let at = now + Duration::from_millis(step * REPAIR_REQUEST_TIMEOUT_MS);
+            let repairs = test.select(&store, Some(at));
+            let probes = repairs
+                .iter()
+                .filter(|r| matches!(r, ShredRepairType::HighestShred(_, 0)))
+                .count();
+            assert!(probes <= 8);
+            if step == 0 {
+                assert!(repairs.contains(&ShredRepairType::HighestShred(121, 0)));
+                assert_eq!(probes, 8);
+            }
+            let repeated = test.select(&store, Some(at));
+            assert!(
+                !repeated
+                    .iter()
+                    .any(|r| matches!(r, ShredRepairType::HighestShred(_, 0)))
+            );
+            if repairs.contains(&ShredRepairType::HighestShred(101, 0)) {
+                discovered = true;
+                break;
+            }
+        }
+        assert!(
+            discovered,
+            "a frozen child must not permanently hide its unknown siblings"
+        );
+    }
 
     fn new_test_cluster_info() -> ClusterInfo {
         let keypair = Arc::new(Keypair::new());
