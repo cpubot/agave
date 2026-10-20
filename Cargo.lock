@@ -11605,6 +11605,7 @@ dependencies = [
  "agave-banking-stage-ingress-types",
  "agave-jemalloc",
  "agave-logger",
+ "agave-wake-channel",
  "assert_matches",
  "crossbeam-channel",
  "crossbeam-utils",
