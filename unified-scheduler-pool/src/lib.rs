@@ -23,7 +23,7 @@ use {
         Sender as WakeSender, SharedEventReceiver as WakeReceiver, TryRecvError, WakeEvent,
     },
     assert_matches::assert_matches,
-    crossbeam_channel::{self, Receiver, RecvError, RecvTimeoutError, SendError, Sender},
+    crossbeam_channel::{self, RecvError, RecvTimeoutError, SendError, Sender},
     crossbeam_utils::CachePadded,
     dashmap::DashMap,
     derive_where::derive_where,
@@ -1195,8 +1195,8 @@ struct ThreadManager<S: SpawnableScheduler<TH>, TH: TaskHandler> {
     pool: Arc<SchedulerPool<S, TH>>,
     new_task_sender: WakeSender<NewTaskPayload>,
     new_task_receiver: Option<WakeReceiver<NewTaskPayload>>,
-    session_result_sender: Sender<ResultWithTimings>,
-    session_result_receiver: Receiver<ResultWithTimings>,
+    session_result_sender: WakeSender<ResultWithTimings>,
+    session_result_receiver: agave_wake_channel::Receiver<ResultWithTimings>,
     session_result_with_timings: Option<ResultWithTimings>,
     scheduler_thread: Option<JoinHandle<()>>,
     handler_threads: Vec<JoinHandle<()>>,
@@ -1245,7 +1245,7 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
     fn new(pool: Arc<SchedulerPool<S, TH>>) -> Self {
         let (new_task_sender, new_task_receiver) =
             agave_wake_channel::unbounded_with_wake_event(Arc::new(WakeEvent::default()));
-        let (session_result_sender, session_result_receiver) = crossbeam_channel::unbounded();
+        let (session_result_sender, session_result_receiver) = agave_wake_channel::unbounded();
 
         Self {
             scheduler_id: pool.new_scheduler_id(),
